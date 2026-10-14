@@ -111,11 +111,10 @@ TASK_PLANS: dict[str, TaskPlan] = {
     ),
 
     # ---------------- 已实测发事件包无效 ----------------
-    "RichMeow_Chat": TaskPlan(
-        "RichMeow_Chat", MANUAL, [],
-        "桌面端对话：实测 chat_request_send 等 5 个事件均不计数，"
-        "上游按客户端类型判定，需真实桌面端对话",
-    ),
+    # 注意：`RichMeow_Chat` 曾经在这里被登记为 MANUAL（"发事件包无效"），
+    # 但下方又有一条 AUTO 定义（走桌面指纹事件链，已实测点亮 +100）。
+    # dict 字面量**后者覆盖前者**，所以这里的旧条目从来没有生效过 ——
+    # 属于纯粹的误导（两处注释互相矛盾）。已删除，只保留下方生效的那条。
     "expert_5_paid": TaskPlan(
         "expert_5_paid", MANUAL, [],
         "召唤专家（付费版）：同上",
@@ -278,6 +277,12 @@ MODEL_ALIASES = {
 }
 
 #: 模式匹配务必避开的 code —— 这些看着像某类，但实测不可做或另有语义。
+#:
+#: ⚠️ 生效范围仅限**没有**在 `TASK_PLANS` 里登记过的 code。
+#: 因为 `plan_for` 先查精确表再查这里，所以 `expert_5_paid` 本身永远不会
+#: 走到这个分支（它在 TASK_PLANS 里已登记为 MANUAL，结果一致）；
+#: 这个集合真正的价值是拦住匹配到 PATTERN_RULES 的**变体/新 code**
+#: （如 `expert_5_paid_v2`），避免它们被模式规则误判成可自动完成。
 PATTERN_DENY = {
     "expert_5_paid",       # 付费版，无收益
 }

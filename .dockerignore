@@ -1,0 +1,51 @@
+# 构建镜像时排除的文件 —— 防止 .env / 日志 / 缓存 / 本地数据库被意外打进镜像。
+#
+# 特别重要：`.env` 里有 ADMIN_JWT_SECRET、ADMIN_PASSWORD、API Key 等真实凭据。
+# 一旦某个 Dockerfile 改成 `COPY . .`，没有本文件就会把这些密钥固化进镜像层，
+# 之后即使删掉文件，镜像历史里依然可以取回。
+
+# 凭据与本地配置
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# 本地数据 / 运行时产物
+logs/
+*.log
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 版本控制 / CI / 编辑器
+.git/
+.gitignore
+.github/
+.idea/
+.vscode/
+
+# 构建与测试产物
+dist/
+build/
+.desktop-build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 桌面端与脚本（容器用不到；体积大）
+desktop/
+scripts/
+tests/
+*.spec

@@ -1473,7 +1473,7 @@ function uiSelectHTML(id, opts) {
     <div class="ui-select-panel">
       ${options.map(o => `
         <div class="ui-select-opt ${String(o.value) === val ? "sel" : ""}"
-             data-value="${esc(String(o.value))}" onclick="uiSelectPick('${id}','${esc(String(o.value))}', event)">
+             data-value="${esc(String(o.value))}" onclick="uiSelectPick('${id}','${escJs(String(o.value))}', event)">
           <span class="truncate">${esc(o.label)}</span>
           ${String(o.value) === val ? '<i class="fa-solid fa-check"></i>' : ""}
         </div>`).join("") || '<div class="ui-select-opt text-slate-400">无可选项</div>'}
@@ -1553,6 +1553,18 @@ async function safeJson(r) {
   catch (e) { return { ok: false, status: r.status, data: { detail: t || ("HTTP " + r.status), _parse_error: true } }; }
 }
 function toast(msg, type = "ok") {
+  const c = type === "ok" ? "bg-emerald-600" : "bg-red-600";
+  const el = document.createElement("div");
+  el.className = `text-white text-sm px-4 py-2 rounded-lg shadow ${c} fade-in`;
+  // 默认转义：toast 的文本绝大多数来自服务端/上游错误消息
+  // （如 WbLoginError 会把上游 JSON 的 msg 原样带回），直接 innerHTML 会执行其中的 HTML/JS。
+  // 需要富文本的调用点显式传 `html=true`（见下方 toastHtml）。
+  el.textContent = String(msg == null ? "" : msg);
+  $("#toasts").appendChild(el);
+  setTimeout(() => el.remove(), 3200);
+}
+/** 需要粗体/换行等简单标记时使用；调用方**必须**自行保证 html 可信用。 */
+function toastHtml(msg, type = "ok") {
   const c = type === "ok" ? "bg-emerald-600" : "bg-red-600";
   const el = document.createElement("div");
   el.className = `text-white text-sm px-4 py-2 rounded-lg shadow ${c} fade-in`;
@@ -1768,7 +1780,37 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closeSideMenu();
 });
 
-function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+// HTML 转义。**必须包含单引号**：本文件大量把数据插进 `onclick="fn('${esc(x)}')"`
+// 这类「HTML 属性内的 JS 字符串」上下文，此时双引号会被 HTML 解码回 `"`，
+// 真正决定 JS 字符串边界的其实是单引号 —— 只转义 &<>" 时，一个账号名
+// （来自上游 nickname）里的 `'` 就能闭合字符串并注入任意 JS。
+// join.html 的同名函数一直是含单引号的正确版本，此处此前漏了。
+function esc(s){ return (s==null?"":String(s)).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+/**
+ * 用于「HTML 属性里的 JS 字符串字面量」上下文，例如
+ *     onclick="fn('${escJs(name)}')"
+ *
+ * 为什么不能只用 esc()：浏览器的解析是**两段式**的 ——
+ *   1) HTML 解析器先把属性值里的实体解码（`&#39;` → `'`）；
+ *   2) 解码后的文本再交给 JS 解析器。
+ * 所以 `esc()` 产出的 `&#39;` 会在第 1 步变回真正的单引号，第 2 步就把它
+ * 当作 JS 字符串的**结束引号** —— 注入照样成立。实测确认：
+ *   esc("a');fetch('//evil/')//") 仍会闭合字符串并执行 fetch。
+ *
+ * 正确做法是**两层转义**：先做 JS 字符串转义（引号加反斜杠），再整体做 HTML 转义。
+ * 两步分别对付两个解析器，任何一侧都无法逃逸。
+ */
+function escJs(s){
+  const js = String(s == null ? "" : s)
+    .replace(/\\/g, "\\\\")      // 反斜杠必须先处理
+    .replace(/'/g, "\\'")
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r")
+    .replace(/\u2028/g, "\\u2028")   // JS 里的行分隔符
+    .replace(/\u2029/g, "\\u2029");
+  return esc(js);
+}
 function card(t, v, ic, col) {
   return `<div class="card p-4"><div class="text-slate-400 text-xs">${t}</div>
     <div class="mt-1 flex items-center gap-2"><i class="fa-solid ${ic} ${col}"></i><span class="text-2xl font-bold">${v}</span></div></div>`;
@@ -1793,10 +1835,10 @@ function statCard(label, value, opts) {
   opts = opts || {};
   const cls = opts.tone ? ` is-${opts.tone}` : "";
   const icon = opts.icon ? `<i class="fa-solid ${opts.icon} ${opts.iconColor || ''}"></i>` : "";
-  const sub = opts.sub ? `<div class="stat-sub">${opts.sub}</div>` : "";
+  const sub = opts.sub ? `<div class="stat-sub">${esc(opts.sub)}</div>` : "";
   return `<div class="stat${cls}">
     <div class="stat-label">${icon}${esc(label)}</div>
-    <div class="stat-value">${value}</div>${sub}</div>`;
+    <div class="stat-value">${esc(value)}</div>${sub}</div>`;
 }
 
 /**
@@ -2058,7 +2100,7 @@ async function openModelLimits(accountId = null) {
       <h4 class="health-title">模型健康 · 近 24 小时</h4>
       <div class="overflow-x-auto"><table class="tbl health-table"><thead><tr><th>模型</th><th>可选 / 受限账号</th><th>成功 / 请求</th><th>失败率</th><th>首响应 P50 / P95</th><th>总耗时 P95</th><th>最早冷却截止</th></tr></thead><tbody>${healthResult.ok ? (healthResult.data.items || []).map(m => `<tr><td><b>${esc(m.model)}</b>${m.free ? '<small class="health-free">免费</small>' : ''}</td><td>${m.available_accounts} / ${m.limited_accounts}</td><td>${m.successes} / ${m.requests}</td><td>${m.failure_rate == null ? '—' : (m.failure_rate * 100).toFixed(1) + '%'}</td><td>${m.ttfb_ms.p50 == null ? '—' : m.ttfb_ms.p50 + ' ms'} / ${m.ttfb_ms.p95 == null ? '—' : m.ttfb_ms.p95 + ' ms'}</td><td>${m.latency_ms.p95 == null ? '—' : m.latency_ms.p95 + ' ms'}</td><td>${m.earliest_model_recovery ? fmtTime(m.earliest_model_recovery) : '—'}</td></tr>`).join('') || '<tr><td colspan="7" class="account-empty">暂无模型观测</td></tr>' : '<tr><td colspan="7" class="account-empty">健康统计暂时不可用</td></tr>'}</tbody></table></div>
       <p class="limit-note">延迟取最近最多 2000 条成功记录；账号可选数包含当前进程在途占用和出口保护。冷却截止只表示可再次尝试，不保证上游模型或账号已恢复可用。</p>
-      <div class="overflow-x-auto"><table class="tbl min-w"><thead><tr><th>账号</th><th>模型</th><th>原因</th><th>重置 / 重试 / 本地冷却截止（北京时间）</th><th>依据</th><th>今日请求 / Token</th><th>操作</th></tr></thead><tbody>${entries.map(e => `<tr><td>${esc(e.account_name)}</td><td>${esc(e.model)}</td><td>${kind[e.kind] || esc(e.kind)}</td><td>${modelLimitDeadlineLabel(e)}<br>${fmtTime(e.until)}</td><td>${source[e.reset_source] || '本地退避策略'}</td><td>${e.requests_today} / ${e.tokens_today}</td><td><button class="console-btn quiet" onclick="clearModelLimit(${e.account_id},${esc(JSON.stringify(e.model))})">解除冷却</button></td></tr>`).join('') || '<tr><td colspan="7" class="account-empty">当前没有模型冷却记录</td></tr>'}</tbody></table></div>`;
+      <div class="overflow-x-auto"><table class="tbl min-w"><thead><tr><th>账号</th><th>模型</th><th>原因</th><th>重置 / 重试 / 本地冷却截止（北京时间）</th><th>依据</th><th>今日请求 / Token</th><th>操作</th></tr></thead><tbody>${entries.map(e => `<tr><td>${esc(e.account_name)}</td><td>${esc(e.model)}</td><td>${kind[e.kind] || esc(e.kind)}</td><td>${modelLimitDeadlineLabel(e)}<br>${fmtTime(e.until)}</td><td>${source[e.reset_source] || '本地退避策略'}</td><td>${e.requests_today} / ${e.tokens_today}</td><td><button class="console-btn quiet" onclick="clearModelLimit(${e.account_id},'${escJs(e.model)}')">解除冷却</button></td></tr>`).join('') || '<tr><td colspan="7" class="account-empty">当前没有模型冷却记录</td></tr>'}</tbody></table></div>`;
   } catch(e) {
     const container = document.getElementById('modelLimitsContent');
     if (container) container.textContent = '读取失败，请稍后重试';
@@ -2517,8 +2559,8 @@ function renderGrowthTasks(d){
       <td class="px-3 py-2 text-amber-600 font-medium">${t.reward_credit || 0}</td>
       <td class="px-3 py-2 text-xs text-slate-400 max-w-[16rem]">${esc(t.strategy || "")}</td>
       <td class="px-3 py-2 text-right whitespace-nowrap">
-        ${canClaim ? `<button onclick="growthDoClaim(${d.account_id},'${esc(t.task_code)}',this)" class="text-xs px-2 py-1 rounded border border-amber-300 text-amber-700 hover:bg-amber-50">领奖</button>` : ""}
-        ${canRun ? `<button onclick="growthDoRun(${d.account_id},'${esc(t.task_code)}',this)" class="text-xs px-2 py-1 rounded border border-emerald-300 text-emerald-700 hover:bg-emerald-50 ml-1">完成</button>` : ""}
+        ${canClaim ? `<button onclick="growthDoClaim(${d.account_id},'${escJs(t.task_code)}',this)" class="text-xs px-2 py-1 rounded border border-amber-300 text-amber-700 hover:bg-amber-50">领奖</button>` : ""}
+        ${canRun ? `<button onclick="growthDoRun(${d.account_id},'${escJs(t.task_code)}',this)" class="text-xs px-2 py-1 rounded border border-emerald-300 text-emerald-700 hover:bg-emerald-50 ml-1">完成</button>` : ""}
       </td>
     </tr>`;
   }).join("");
@@ -2540,7 +2582,7 @@ function renderGrowthTasks(d){
       <button onclick="growthDoClaim(${d.account_id},null,this)" ${claimable.length ? "" : "disabled"}
         class="text-sm px-3 py-1.5 rounded-lg border border-amber-300 text-amber-700 hover:bg-amber-50 disabled:opacity-40 disabled:cursor-not-allowed">
         <i class="fa-solid fa-gift mr-1"></i> 领取全部奖励 (${claimable.length})</button>
-      <button onclick="growthTasks(${d.account_id},'${esc(d.name || "")}')" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50">
+      <button onclick="growthTasks(${d.account_id},'${escJs(d.name || "")}')" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50">
         <i class="fa-solid fa-rotate mr-1"></i> 刷新</button>
     </div>
     <div class="card overflow-auto max-h-[55vh]">
@@ -2780,7 +2822,7 @@ async function viewCreditDetails(id, name, force){
   openModal(`<h3 class="font-bold mb-1"><i class="fa-solid fa-list-ul mr-1"></i> 积分明细 — ${esc(name)}</h3>
     <div class="flex items-center justify-between mb-3 gap-2">
       <p class="text-xs m-0" style="color:var(--fg-muted)">按到期时间升序 —— 排最前的就是最先作废的包。</p>
-      <button onclick="viewCreditDetails(${id},'${esc(name)}',true)" id="cdReloadBtn"
+      <button onclick="viewCreditDetails(${id},'${escJs(name)}',true)" id="cdReloadBtn"
               class="text-xs px-2-5 py-1.5 rounded-lg border hover:bg-slate-50 whitespace-nowrap">
         <i class="fa-solid fa-cloud-arrow-down mr-1"></i>重新采集</button>
     </div>
@@ -2953,7 +2995,7 @@ async function scanLocal(){
         <div class="flex flex-wrap items-center justify-end gap-1.5">
           ${it.is_active?'<span class="px-2 py-0.5 rounded-full text-[10px] bg-emerald-100 text-emerald-700">当前</span>':''}
           ${inPool?'<span class="px-2 py-0.5 rounded-full text-[10px] bg-indigo-100 text-indigo-700">号池已有</span>':''}
-          <button onclick="importOne('${encodeURIComponent(it.file)}')" ${inPool?'disabled':''} class="${inPool?'text-slate-300 cursor-not-allowed border-slate-100 bg-slate-50':'text-indigo-600 hover:text-indigo-800 border-indigo-100 hover:bg-indigo-50'} text-xs font-medium px-2 py-1 rounded border"><i class="fa-solid ${inPool?'fa-check':'fa-download'} mr-1"></i>${inPool?'已导入':'导入'}</button>
+          <button data-file="${esc(encodeURIComponent(it.file))}" onclick="importOne(this.dataset.file)" ${inPool?'disabled':''} class="${inPool?'text-slate-300 cursor-not-allowed border-slate-100 bg-slate-50':'text-indigo-600 hover:text-indigo-800 border-indigo-100 hover:bg-indigo-50'} text-xs font-medium px-2 py-1 rounded border"><i class="fa-solid ${inPool?'fa-check':'fa-download'} mr-1"></i>${inPool?'已导入':'导入'}</button>
         </div>
       </td>
     </tr>`;
@@ -2976,7 +3018,7 @@ async function scanLocal(){
           <div class="flex flex-wrap items-center gap-1.5 mt-2">
             ${it.is_active?'<span class="px-2 py-0.5 rounded-full text-[10px] bg-emerald-100 text-emerald-700">当前</span>':''}
             ${inPool?'<span class="px-2 py-0.5 rounded-full text-[10px] bg-indigo-100 text-indigo-700">号池已有</span>':''}
-            <button onclick="importOne('${encodeURIComponent(it.file)}')" ${inPool?'disabled':''} class="${inPool?'text-slate-300 cursor-not-allowed border-slate-100 bg-slate-50':'text-indigo-600 hover:text-indigo-800 border-indigo-100 hover:bg-indigo-50'} text-xs font-medium px-2 py-1 rounded border"><i class="fa-solid ${inPool?'fa-check':'fa-download'} mr-1"></i>${inPool?'已导入':'导入'}</button>
+            <button data-file="${esc(encodeURIComponent(it.file))}" onclick="importOne(this.dataset.file)" ${inPool?'disabled':''} class="${inPool?'text-slate-300 cursor-not-allowed border-slate-100 bg-slate-50':'text-indigo-600 hover:text-indigo-800 border-indigo-100 hover:bg-indigo-50'} text-xs font-medium px-2 py-1 rounded border"><i class="fa-solid ${inPool?'fa-check':'fa-download'} mr-1"></i>${inPool?'已导入':'导入'}</button>
           </div>
         </div>
       </div>
@@ -3371,7 +3413,7 @@ function renderCreditAccounts(d) {
         ${a.synced_at ? `<div class="text-[10px] mt-0.5" style="color:var(--fg-subtle)">${fmtTime(new Date(a.synced_at).toISOString().replace('T',' ').slice(0,19), false)} 采集</div>` : ""}</td>
       <td class="align-top" style="min-width:230px">${next || `<span class="text-[11px]" style="color:var(--fg-subtle)">没有仍有剩余的积分包</span>`}</td>
       <td class="align-top text-right whitespace-nowrap">
-        <button onclick="viewCreditDetails(${a.account_id},'${esc(a.account_name)}')" class="text-amber-600 hover:text-amber-800 mr-1" title="查看全部积分包"><i class="fa-solid fa-list-ul"></i></button>
+        <button onclick="viewCreditDetails(${a.account_id},'${escJs(a.account_name)}')" class="text-amber-600 hover:text-amber-800 mr-1" title="查看全部积分包"><i class="fa-solid fa-list-ul"></i></button>
         <button onclick="refreshAcc(${a.account_id}).then(loadCreditStats)" class="text-indigo-600 hover:text-indigo-800" title="重新采集该账号"><i class="fa-solid fa-rotate"></i></button>
       </td>
     </tr>`;
@@ -3741,8 +3783,8 @@ function keyRow(k) {
           : `<span class="text-xs text-slate-300" title="不限制，可用全部启用模型">全部模型</span>`}</td>
       <td class="px-4 py-3 col-status">${k.status==="active"?'<span class="badge bg-emerald-100 text-emerald-700">正常</span>':'<span class="badge bg-slate-100 text-slate-500">已吊销</span>'}</td>
       <td class="px-4 py-3 text-right whitespace-nowrap">
-        <button onclick="viewKeyUsage(${k.id},'${esc(k.name||'')}')" class="text-blue-600 hover:text-blue-800 mr-1" title="查看用量"><i class="fa-solid fa-chart-pie"></i></button>
-        <button onclick="viewKeyFull(${k.id},'${esc(k.name||'')}')" class="text-violet-600 hover:text-violet-800 mr-1" title="查看完整Key"><i class="fa-solid fa-eye"></i></button>
+        <button onclick="viewKeyUsage(${k.id},'${escJs(k.name||'')}')" class="text-blue-600 hover:text-blue-800 mr-1" title="查看用量"><i class="fa-solid fa-chart-pie"></i></button>
+        <button onclick="viewKeyFull(${k.id},'${escJs(k.name||'')}')" class="text-violet-600 hover:text-violet-800 mr-1" title="查看完整Key"><i class="fa-solid fa-eye"></i></button>
         <button onclick="editKey(${k.id})" class="text-indigo-600 hover:text-indigo-800 mr-1" title="调整"><i class="fa-solid fa-sliders"></i></button>
         <button onclick="deleteKey(${k.id})" class="text-red-500 hover:text-red-700" title="删除"><i class="fa-solid fa-trash"></i></button>
       </td>
@@ -3947,15 +3989,19 @@ function scheduleModelBusy() {
 async function loadModelBusy() {
   if (_modelBusyLoading || document.hidden || !TOKEN || $('#panel-models').classList.contains('hidden')) return;
   _modelBusyLoading = true;
+  // 这段是异步的，而 renderModelPage(_modelPage) 会重写整个列表。
+  // 用户在此期间手动翻页/刷新时，晚到的响应会覆盖新数据（后发先至）。
+  // 记下发起时的页码，回来若已变化就丢弃渲染结果。
+  const pageAtRequest = _modelPage;
   try {
     const r = await api('/api/models/busy');
     if (!r.ok) throw new Error('busy fetch failed');
     const d = await r.json();
     _modelBusy = Object.fromEntries((d.items || []).map(m => [m.model_id, {...m, observed_at:d.observed_at, stale:d.stale}]));
-    renderModelPage(_modelPage);
+    if (_modelPage === pageAtRequest) renderModelPage(_modelPage);
   } catch(e) {
     Object.values(_modelBusy).forEach(m => { m.stale = true; });
-    renderModelPage(_modelPage);
+    if (_modelPage === pageAtRequest) renderModelPage(_modelPage);
   } finally { _modelBusyLoading = false; }
 }
 document.addEventListener('visibilitychange', () => {
@@ -3976,7 +4022,7 @@ function modelRow(m) {
       <td class="px-4 py-3 text-slate-400 text-xs">${esc(m.note||'-')}</td>
       <td class="px-4 py-3 col-status">${m.enabled?'<span class="badge bg-emerald-100 text-emerald-700">启用</span>':'<span class="badge bg-slate-100 text-slate-500">禁用</span>'}</td>
       <td class="px-4 py-3 text-right whitespace-nowrap">
-        <button onclick="speedTestModel(${JSON.stringify(m.model_id)}, this)" class="text-sky-600 hover:text-sky-800 text-sm mr-2" title="测速（用账号池直接请求上游，免 Key）"><i class="fa-solid fa-gauge-high"></i></button>
+        <button onclick="speedTestModel('${escJs(m.model_id)}', this)" class="text-sky-600 hover:text-sky-800 text-sm mr-2" title="测速（用账号池直接请求上游，免 Key）"><i class="fa-solid fa-gauge-high"></i></button>
         <button onclick="toggleModel(${m.id},${!m.enabled})" class="${m.enabled?'text-amber-600 hover:text-amber-800':'text-emerald-600 hover:text-emerald-800'} text-sm mr-2" title="${m.enabled?'禁用':'启用'}"><i class="fa-solid ${m.enabled?'fa-ban':'fa-check'}"></i></button>
         <button onclick="deleteModelConfig(${m.id})" class="text-red-500 hover:text-red-700" title="移除"><i class="fa-solid fa-trash"></i></button>
       </td>
@@ -4068,12 +4114,12 @@ async function speedTestModel(modelId, btn){
   try{
     const r = await api("/api/models/speed-test",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:modelId})});
     const d = await r.json();
-    if(!r.ok){ toast(`测速失败(${modelId}): ${esc(d.detail||"")}`,"err"); return; }
+    if(!r.ok){ toast(`测速失败(${modelId}): ${d.detail||""}`,"err"); return; }
     const ttft = d.ttft_ms!=null ? d.ttft_ms+"ms" : "—";
     const sp = d.speed_tps!=null ? d.speed_tps+" t/s" : "—";
     const comp = d.completion_tokens!=null ? d.completion_tokens : (d.total_tokens??0);
     const prompt = d.prompt_tokens!=null ? d.prompt_tokens : "—";
-    toast(`<b>${esc(modelId)}</b> 测速：首字 ${ttft} · 提示 ${prompt} / 补全 ${comp} tok · ${sp}` + (d.account?` · 账号 ${esc(d.account)}`:""), "ok");
+    toastHtml(`<b>${esc(modelId)}</b> 测速：首字 ${ttft} · 提示 ${prompt} / 补全 ${comp} tok · ${sp}` + (d.account?` · 账号 ${esc(d.account)}`:""), "ok");
   }catch(e){ toast("测速异常: "+e.message,"err"); }
   finally{ if(btn){ btn.disabled=false; btn.innerHTML = old; } }
 }
@@ -4503,11 +4549,16 @@ async function doUnpack(){
 
 function _pollUnpack(){
   if(_unpackTimer) clearInterval(_unpackTimer);
+  // 连续失败计数：网络抖动/后端重启时不能无限刷错误，也不能让
+  // unhandled rejection 每 700ms 冒一次。
+  let fails = 0;
   const tick = async () => {
-    const r = await api("/api/app-source/unpack/progress");
-    if(!r.ok) return;
-    const d = await r.json();
-    if(!d.exists){ _stopUnpackPoll(); return; }
+    try {
+      const r = await api("/api/app-source/unpack/progress");
+      if(!r.ok) return;
+      const d = await r.json();
+      fails = 0;
+      if(!d.exists){ _stopUnpackPoll(); return; }
     const pct = d.total ? Math.floor((d.done||0)/d.total*100) : 0;
     if($("#unpackBar")) $("#unpackBar").style.width = pct + "%";
     if($("#unpackPct")) $("#unpackPct").textContent = pct + "%";
@@ -4534,6 +4585,11 @@ function _pollUnpack(){
           </div>`;
       }
       await loadAppSource();
+    }
+    } catch(e) {
+      // 网络错误 / 非 JSON 响应：以前会变成 unhandled rejection 且每 700ms 刷一次。
+      // 连续失败 5 次就停轮询，避免永久刷错；期间保持静默（进度条停在原处）。
+      if(++fails >= 5) _stopUnpackPoll();
     }
   };
   tick();
@@ -5141,7 +5197,7 @@ function renderGroups() {
       <td class="px-4 py-3 text-slate-500 text-xs">${esc(g.note || "-")}</td>
       <td class="px-4 py-3 text-right whitespace-nowrap">
         <button onclick="openGroupEditor(${g.id})" class="text-blue-600 hover:text-blue-700 mr-3" title="编辑"><i class="fa-solid fa-pen"></i></button>
-        <button onclick="deleteGroup(${g.id}, '${esc(g.name)}')" class="text-red-500 hover:text-red-600" title="删除"><i class="fa-solid fa-trash"></i></button>
+        <button onclick="deleteGroup(${g.id}, '${escJs(g.name)}')" class="text-red-500 hover:text-red-600" title="删除"><i class="fa-solid fa-trash"></i></button>
       </td>
     </tr>`;
   }).join("");
@@ -5212,7 +5268,7 @@ function renderGeModels() {
     box.innerHTML = list.map(m => `
       <label class="flex items-center gap-2 px-2 py-1 rounded hover:bg-slate-50 cursor-pointer text-sm">
         <input type="checkbox" ${_geSelected.has(m.model_id) ? "checked" : ""}
-               onchange="geToggle('${esc(m.model_id)}', this.checked)" />
+               onchange="geToggle('${escJs(m.model_id)}', this.checked)" />
         <span class="font-mono text-xs">${esc(m.model_id)}</span>
         ${m.is_free ? `<span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">免费</span>`
                     : `<span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">x${m.credit_multiplier}</span>`}

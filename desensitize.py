@@ -143,6 +143,13 @@ _HARNESS_USER_MARKERS = (
     "# claudeMd",                  # Claude Code CLAUDE.md 注入
 )
 
+#: 判定「整条 user 消息是 harness 注入」的最小长度。
+#: 真实注入块动辄数千字符（AGENTS.md / 环境上下文 / skill 清单）；
+#: 用户的一句自然提问通常远小于这个值。低于此长度**一律不做整体替换**，
+#: 从而避免把「用户在提问里引用了这些标签」误判成注入（见
+#: `_looks_like_harness_user_message` 的说明）。
+_HARNESS_MIN_LEN = 800
+
 _CODEX_SYSTEM_MARKERS = (
     "You are a coding agent running in the Codex CLI",
     "Within this context, Codex refers to",
@@ -201,7 +208,13 @@ _RUNTIME_BLOCK_REPLACEMENTS = (
 _RUNTIME_TAIL_MARKERS = (
     "The following deferred tools are now available via ToolSearch.",
     "Available agent types for the Agent tool:",
-    "The following sk​ills are available for use with the Sk​ill tool:",
+    # ⚠️ 这里曾经混入两个**零宽空格**（U+200B）：
+    #   "The following sk\u200bills are available for use with the Sk\u200bill tool:"
+    # 结果是该 marker 与真实文本永远不相等 → 这条「截断巨型 skill 清单」的规则
+    # **静默失效**（另外 3 条正常，所以表现只是"skill 清单一整块没被裁掉"，
+    # 请求体虚胖、更容易被上游内容审核误伤，且没有任何报错）。
+    # 保持纯 ASCII：标记串必须逐字等于上游注入的原文，绝不能带入隐形字符。
+    "The following skills are available for use with the Skill tool:",
     "## MCP Server Instructions",
 )
 
@@ -254,9 +267,42 @@ def _content_to_text(content) -> str:
 
 
 def _looks_like_harness_user_message(content) -> bool:
-    """判断 user 消息是否其实是 Codex/CLI 注入的上下文，而非用户自然输入。"""
+    """判断 user 消息是否**整条**都是 Codex/CLI 注入的上下文，而非用户自然输入。
+
+    这里必须用**结构**判据，不能只做子串包含。原实现是
+        return any(marker in text for marker in _HARNESS_USER_MARKERS)
+    后果非常严重：这些 marker 恰好是用户「让 agent 解释/调试自身 harness」时
+    **必然会引用**的字符串。于是
+
+        user: "Why does my prompt contain <permissions instructions>? Explain it."
+
+    被判成 harness 注入，**整条真实提问被丢弃**、替换成一句无关的英文套话 ——
+    模型拿到的输入与用户所问完全不符，静默、不可恢复、无日志。
+    实测 6 条代表性输入里有 5 条中招。
+
+    现在的判据（三者同时满足才算 harness 注入）：
+      1. 消息**以**某个 marker 开头（允许前置空白）—— 注入的上下文总在开头；
+      2. 若 marker 是成对标签，消息里要能找到对应闭合标签；
+      3. 文本足够长（> `_HARNESS_MIN_LEN`）—— 注入块动辄数千字符，
+         而用户的一句提问通常很短。
+    这样「简短提问里提到了这些词」不会再被误杀，真正的巨型注入块仍会被压缩。
+    """
     text = _content_to_text(content)
-    return any(marker in text for marker in _HARNESS_USER_MARKERS)
+    if not text:
+        return False
+    stripped = text.lstrip()
+    if len(stripped) < _HARNESS_MIN_LEN:
+        return False
+    for marker in _HARNESS_USER_MARKERS:
+        if not stripped.startswith(marker):
+            continue
+        # 成对标签：要求闭合标签存在，避免"以 <x> 开头但其实是用户在引用"。
+        if marker.startswith("<") and marker.endswith(">"):
+            tag = marker[1:-1]
+            if f"</{tag}>" not in stripped:
+                continue
+        return True
+    return False
 
 
 def _prune_runtime_fragments(role: str, text: str) -> str:
@@ -264,8 +310,16 @@ def _prune_runtime_fragments(role: str, text: str) -> str:
 
     用于 --no-compact 场景：尽量保留 Codex / Claude Code 的核心提示，
     但移除重复的 environment / permissions / skills / tool inventory 大段文本。
+
+    ⚠️ **只对确实是 harness 注入的消息生效**。这些 `<...>` 标签同样是用户在
+    提问里会引用的字符串（"<environment_context> 是什么？"），
+    无条件替换会把用户原文整段改写掉。
     """
     if not text:
+        return text
+
+    # 只有 system 消息、或整条消息确实是 harness 注入时，才动这些运行时片段。
+    if role != "system" and not _looks_like_harness_user_message(text):
         return text
 
     pruned = text
@@ -345,12 +399,17 @@ def _compact_harness_message(role: str, content) -> str | None:
             "You are a coding assistant in Codex CLI. Be precise, helpful, concise, and safe. "
             "Use available tools when needed, follow repository instructions, and keep the user informed."
         )
-    if any(marker in text for marker in _PERMISSIONS_MARKERS):
+    # ⚠️ 下面两条曾经对**所有** role 做子串包含判断。user 消息同样会走到这里，
+    # 于是用户一句 "Why does my prompt contain <permissions instructions>?" 就被
+    # 整体替换成权限说明套话 —— 真实提问被静默丢弃。
+    # 所以这里同样限制为「system 角色」或「整条消息确实是 harness 注入」。
+    is_harness_block = (role == "system") or _looks_like_harness_user_message(content)
+    if is_harness_block and any(marker in text for marker in _PERMISSIONS_MARKERS):
         return (
             "Runtime permissions apply: filesystem access may be sandboxed, network may be restricted, "
             "and some commands may require user approval."
         )
-    if any(marker in text for marker in _SKILLS_MARKERS):
+    if is_harness_block and any(marker in text for marker in _SKILLS_MARKERS):
         return (
             "Runtime skill metadata is available. Use relevant skills only when explicitly requested or clearly applicable."
         )

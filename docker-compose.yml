@@ -27,19 +27,29 @@ services:
     restart: unless-stopped
 
   # 管理后台（多账号反代 + API Key 网关）。
-  # 默认连本机已在运行的 MySQL(3306)/Redis(6379)；若改到容器内实例，
-  # 把下方 ADMIN_DATABASE_URL / ADMIN_REDIS_URL 指向对应服务名即可。
+  #
+  # ⚠️ 数据库/Redis 地址默认指向 `host.docker.internal` 而不是 127.0.0.1：
+  # 容器内的 127.0.0.1 是**容器自己**，连不上宿主机已在跑的 MySQL/Redis。
+  # 若改到容器内实例，把下面两行指到对应 service 名即可。
   admin:
     build: .
     container_name: workbuddy_admin
     ports:
       - "8790:8790"
+    extra_hosts:
+      # Linux 上 Docker 不自动提供 host.docker.internal，这里显式映射。
+      - "host.docker.internal:host-gateway"
     environment:
       - ADMIN_PORT=8790
-      - ADMIN_DATABASE_URL=mysql+pymysql://root:root@127.0.0.1:3306/workbuddy_admin?charset=utf8mb4
-      - ADMIN_REDIS_URL=redis://127.0.0.1:6379/0
+      - ADMIN_DATABASE_URL=mysql+pymysql://root:root@host.docker.internal:3306/workbuddy_admin?charset=utf8mb4
+      - ADMIN_REDIS_URL=redis://host.docker.internal:6379/0
       - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-123456}
+      # ⚠️ 不再提供 `:-123456` 这种弱口令兜底：以前不设 ADMIN_PASSWORD 时会
+      # 用 123456 起服务、并把 8790 端口暴露到宿主机，等于把后台直接送人。
+      # 现在未设置就让容器启动失败（compose 变量缺失会报错），强迫部署者显式配置。
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?请先在 .env 或环境变量中设置 ADMIN_PASSWORD}
+      # 固定签发密钥；不设则每次重启随机生成、后台登录态全部失效。
+      - ADMIN_JWT_SECRET=${ADMIN_JWT_SECRET:?请设置 ADMIN_JWT_SECRET（>=32 字节随机串）}
       # 出站 UA / 桌面事件指纹报的客户端版本。容器里读不到宿主机的安装包，
       # 会自动退化到兜底值；要准确就显式指定（见 .env.example）。
       # - WORKBUDDY_DESKTOP_VERSION=5.5.6

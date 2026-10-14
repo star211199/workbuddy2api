@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # workbuddy2api 守护脚本
 # -----------------------------------------------------------------------------
 # 解决的问题：把 `python main.py` 挂在某个终端 / Agent 后台会话里跑，
@@ -97,20 +97,43 @@ $PID | Out-File -FilePath $PidFile -Encoding ASCII -Force
 Write-WatchLog "守护启动（每 ${IntervalSec}s 探活一次，端口 $Port）"
 
 $missCount = 0
+# 连续拉起失败的次数。服务若**持续**起不来（如 venv 缺失、端口被占、
+# 配置错误），原来的循环会每 10s 无脑重试一次并往 daemon.log 狂写 ——
+# 日志迅速膨胀，也看不出现场。这里改为指数退避，并在超过上限后停止尝试。
+$failStreak = 0
+$maxFailStreak = 10
 while ($true) {
     $svcPid = Get-ListenerPid
     if ($svcPid -eq 0) {
         $missCount++
-        Write-WatchLog "检测到服务不在（连续 $missCount 次），正在拉起..."
-        Start-ServiceProcess | Out-Null
+        if ($failStreak -ge $maxFailStreak) {
+            Write-WatchLog "连续 $failStreak 次拉起失败，已停止自动重试（请人工检查后重启守护）。"
+            break
+        }
+        Write-WatchLog "检测到服务不在（连续 $missCount 次，累计失败 $failStreak 次），正在拉起..."
+        try {
+            Start-ServiceProcess | Out-Null
+        } catch {
+            # $ErrorActionPreference 为 Continue，Start-Process 失败通常不抛；
+            # 这里兜一层，避免异常直接跳出守护循环。
+            Write-WatchLog "拉起进程时出错：$_"
+        }
         Start-Sleep -Seconds 8
         $newPid = Get-ListenerPid
         if ($newPid -gt 0) {
             Write-WatchLog "已恢复 PID=$newPid"
             $missCount = 0
+            $failStreak = 0
+        } else {
+            $failStreak++
+            # 指数退避：10s, 20s, 40s ... 上限 5 分钟。
+            $backoff = [Math]::Min([Math]::Pow(2, $failStreak) * $IntervalSec, 300)
+            Write-WatchLog "拉起未成功（第 $failStreak 次），${backoff}s 后重试。"
+            Start-Sleep -Seconds $backoff
         }
     } else {
         if ($missCount -ne 0) { $missCount = 0 }
+        if ($failStreak -ne 0) { $failStreak = 0 }
     }
     Start-Sleep -Seconds $IntervalSec
 }

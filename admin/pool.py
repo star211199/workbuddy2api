@@ -604,7 +604,7 @@ def extract_session_key(body: dict) -> str:
     return ""
 
 
-def fallback_session_key(body: dict) -> str:
+def fallback_session_key(body: dict, scope: str = "") -> str:
     """无会话标识的客户端（OpenAI 兼容协议）派生一个会话级稳定键。
 
     OpenAI 协议的请求体里既没有 conversationId 也没有 metadata，`extract_session_key`
@@ -616,6 +616,12 @@ def fallback_session_key(body: dict) -> str:
     抑制条件：请求体带 `metadata.user_id` 或顶层 `user_id` 时**恒返回空串**。
     这类客户端已显式声明了用户维度，若再借首条 prompt 获得粘性，会把该用户的
     所有并行对话钉到同一账号 —— 正是上面要避免的过粗粒度。
+
+    `scope`（调用方传 API Key 的 id）参与哈希，用于**租户隔离**：
+    裸的 `sha256(首条消息)` 是可预测的 —— 攻击者只要猜到受害者首条消息
+    （常见的 "hi"、公开的系统提示词等），就能算出**同一个**粘性键，
+    从而让自己的请求被钉到受害者的上游账号上（账号定位 + 提示词缓存侧信道
+    + 单号并发饱和）。加入 per-key scope 后，不同 Key 的键空间互不相通。
     """
     if not isinstance(body, dict):
         return ""
@@ -631,7 +637,9 @@ def fallback_session_key(body: dict) -> str:
             break
     if not first:
         return ""
-    digest = hashlib.sha256(first.encode("utf-8", "replace")).hexdigest()
+    # 前缀带 scope，确保不同 API Key 永不共享粘性键。
+    seed = f"{scope}\x00{first}" if scope else first
+    digest = hashlib.sha256(seed.encode("utf-8", "replace")).hexdigest()
     return "d-" + digest[:16]
 
 
@@ -660,9 +668,14 @@ def turn_key(body: dict) -> str:
     return ""
 
 
-def session_key_for(body: dict) -> str:
-    """会话级键：显式会话标识优先，其次首条 user 文本兜底。"""
-    return extract_session_key(body) or fallback_session_key(body)
+def session_key_for(body: dict, scope: str = "") -> str:
+    """会话级键：显式会话标识优先，其次首条 user 文本兜底。
+
+    `scope` 是发起请求的 API Key 标识，用于**租户隔离**：粘性路由的绑定表
+    是单一全局命名空间，若不按 Key 分区，两个不同用户用同样的首条消息
+    （例如都是 "hi"）就会被算成同一个会话、钉到同一个上游账号。
+    """
+    return extract_session_key(body) or fallback_session_key(body, scope)
 
 
 def _has_user_id(body: dict) -> bool:

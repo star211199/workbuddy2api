@@ -10,12 +10,52 @@ import sys
 import tempfile
 import time
 import uuid
+import weakref
 from datetime import datetime
 from pathlib import Path
 
 import httpx
 
 from converter import BACKEND, CredentialManager  # 复用既有后端鉴权 / 刷新 / 模型 / 额度逻辑
+
+
+def _unlink_quietly(path: str) -> None:
+    """删除文件且不抛异常（清理路径专用：失败也无计可施，不该掩盖原错误）。"""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _restrict_to_current_user(path: str) -> None:
+    """把文件权限收紧到「仅当前用户 + SYSTEM + Administrators」。
+
+    为什么需要：这个文件里是**明文 accessToken / refreshToken**。
+    POSIX 下 `mkstemp` 给 0o600 就够了，但 **Windows 上 `os.chmod` 只能改
+    只读位**，实际可读性由 ACL 决定 —— 而 `%TEMP%` 下的新文件会**继承父目录
+    ACL**。在多用户机器上（或父目录 ACL 宽松时），同一台机器的其他用户
+    可能直接读到别人的 token（审计中实测到 `Everyone/Users: Modify`）。
+    这里显式切断继承并只授权当前用户，失败时静默降级（不影响功能）。
+    """
+    if os.name != "nt":
+        return
+    try:
+        import subprocess
+        user = os.environ.get("USERNAME") or ""
+        if not user:
+            return
+        # /inheritance:r 切断继承，只保留显式 ACE；随后只授当前用户。
+        subprocess.run(
+            ["icacls", path, "/inheritance:r",
+             "/grant:r", f"{user}:(R,W)",
+             "/grant:r", "SYSTEM:(F)",
+             "/grant:r", "Administrators:(F)"],
+            capture_output=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        # 权限收紧是「尽力而为」：失败也不能让请求本身崩掉。
+        pass
+
 
 #: 项目根加入 sys.path，便于导入根目录的 wb_install（与 converter 同级）。
 #: admin 包可能在 `uvicorn admin.server:app` 下被导入，此时根目录不一定在
@@ -217,9 +257,39 @@ class AccountSession:
     """把一个账号的 auth_json 包成可用的后端会话。"""
 
     def __init__(self, auth_json: str):
-        self._path = tempfile.mktemp(suffix=".info")
-        with open(self._path, "w", encoding="utf-8") as f:
-            f.write(auth_json)
+        # ⚠️ 原实现用 `tempfile.mktemp()` + `open(..., "w")`，有两个真实问题：
+        #
+        # 1. `mktemp()` 只**返回一个名字但不创建文件**（官方文档已标记为
+        #    insecure/废弃）。在「拿到名字」与「打开文件」之间存在窗口，
+        #    本机任意进程都可以在这个路径上放一个符号链接，随后
+        #    `open(...,"w")` 会跟随链接并**截断本服务有写权限的任意文件**。
+        # 2. 文件里写的是**完整明文凭据**（accessToken / refreshToken）。
+        #    默认权限是 0o666 & ~umask，实测在本机为 `-rw-rw-rw-`，
+        #    即**同一台机器上的任何用户都能读到别人的 token**。
+        #    而它只在显式 `close()` 时才删除；任何异常/进程被杀/请求取消
+        #    都会把明文 token 永久留在系统临时目录（审计中确实抓到了残留文件）。
+        #
+        # 改法：用 `mkstemp` 语义**原子创建**并强制 0o600；同时注册
+        # `weakref.finalize` 兜底，确保对象被回收时一定会 unlink。
+        fd, path = tempfile.mkstemp(suffix=".info", prefix="wb2api-")
+        try:
+            # POSIX 位：mkstemp 本来就建 0o600，这里显式再设一次（某些 umask
+            # 组合下会被放宽）。Windows 上 os.chmod 只影响只读位，真正的
+            # 权限收紧由 `_restrict_to_current_user` 通过 ACL 完成。
+            os.chmod(path, 0o600)
+            _restrict_to_current_user(path)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(auth_json)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            _unlink_quietly(path)
+            raise
+        self._path = path
+        # 兜底清理：即使调用方忘了 close()，GC 时也会删掉明文凭据文件。
+        self._finalizer = weakref.finalize(self, _unlink_quietly, path)
         self.cm = CredentialManager(Path(self._path))
 
     def get_headers(self, extra: dict | None = None) -> dict:
@@ -1601,10 +1671,12 @@ class AccountSession:
         self.close()
 
     def close(self):
+        # 先解除 finalizer（避免重复 unlink），再显式删除；幂等。
         try:
-            os.unlink(self._path)
-        except OSError:
+            self._finalizer.detach()
+        except Exception:
             pass
+        _unlink_quietly(self._path)
 
 
 def _map_checkin_status(code: int) -> str:

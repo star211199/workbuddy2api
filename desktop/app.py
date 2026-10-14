@@ -180,7 +180,24 @@ class DesktopAPI:
         return {"message": self.message, "failed": self.failed}
 
     def desktop_login(self):
-        if self.window.get_current_url() != f"http://127.0.0.1:{self.port}/admin?desktop=1":
+        # 只校验 **path/host/port**，不比较完整 URL。
+        #
+        # 原来是 `!= f".../admin?desktop=1"` 的等值比较，而前端切换面板时会用
+        # history.replaceState 把 `?tab=xxx` 写进地址栏（index.html 的 activateTab），
+        # 于是 URL 变成 `/admin?desktop=1&tab=logs` → 合法的登录请求被**误拒**，
+        # 用户看到"只允许本地桌面界面登录"。查询参数不该影响这个判定。
+        #
+        # 真正的安全边界是 `X-Desktop-Boot` nonce 握手（见 releases.py 的
+        # secrets.compare_digest），这里只是附加的本地性检查。
+        from urllib.parse import urlsplit
+        try:
+            parts = urlsplit(self.window.get_current_url() or "")
+            ok_host = parts.hostname in ("127.0.0.1", "localhost")
+            ok_port = parts.port == self.port
+            ok_path = parts.path.rstrip("/") == "/admin"
+        except Exception:
+            ok_host = ok_port = ok_path = False
+        if not (ok_host and ok_port and ok_path):
             raise RuntimeError("只允许本地桌面界面登录")
         from datetime import datetime, timedelta, timezone
         import jwt

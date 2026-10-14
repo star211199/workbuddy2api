@@ -5,6 +5,7 @@
   2. 在列表中启用/禁用特定模型
   3. 代理转发时自动过滤不在白名单内的模型
 """
+import asyncio
 import httpx
 import json
 import time
@@ -270,8 +271,20 @@ async def speed_test(
                     f"但没有任何「启用且余额大于 0」的账号"
                     f"（本接口不判断在途与冷却状态）"))
 
-    sess = backend.AccountSession(acc.auth_json)
-    headers = sess.get_headers()
+    # ⚠️ 这个端点是 `async def`，所以下面这些**同步阻塞**调用都会卡住事件循环：
+    #   * AccountSession(...)  —— 落盘凭据临时文件（文件 I/O）
+    #   * sess.get_headers()   —— token 过期时会走 `httpx.Client(timeout=15)` 刷新
+    #   * db.commit()          —— 同步 SQLAlchemy
+    # 在事件循环里阻塞的后果不是「慢一点」，而是**整个进程的所有请求一起停摆**
+    # （包括正在跑的 /v1/* 流式响应）。proxy.py 里有一大段注释专门解释
+    # `/v1/models` 为什么必须是 `def`，就是这个原因。
+    # 这里全部丢到线程池执行，保持与 proxy 一致的纪律。
+    sess = await asyncio.to_thread(backend.AccountSession, acc.auth_json)
+    try:
+        headers = await asyncio.to_thread(sess.get_headers)
+    except Exception:
+        await asyncio.to_thread(sess.close)
+        raise
     url = f"{settings.BACKEND}/v2/chat/completions"
     payload = {
         "model": model,
@@ -296,14 +309,20 @@ async def speed_test(
         except Exception:
             pass
 
+    async def _persist_async():
+        await asyncio.to_thread(_persist)
+
+    async def _close_session():
+        await asyncio.to_thread(sess.close)
+
     try:
         async with httpx.AsyncClient(timeout=120, limits=backend.HTTP_LIMITS) as client:
             async with client.stream("POST", url, headers=headers, json=payload) as r:
                 if r.status_code >= 400:
                     detail = await r.aread()
                     msg = detail.decode("utf-8", "replace")[:300]
-                    _persist()
-                    sess.close()
+                    await _persist_async()
+                    await _close_session()
                     raise HTTPException(status_code=r.status_code, detail=f"上游返回错误: {msg}")
                 async for chunk in r.aiter_text():
                     # TTFT：首个非空增量（content 或 reasoning_content）即首字延迟
@@ -341,12 +360,12 @@ async def speed_test(
     except HTTPException:
         raise
     except Exception as e:
-        _persist()
-        sess.close()
+        await _persist_async()
+        await _close_session()
         raise HTTPException(status_code=502, detail=f"测速请求失败: {e}")
 
-    _persist()
-    sess.close()
+    await _persist_async()
+    await _close_session()
 
     total_dur = t_end - t0
     gen_dur = (total_dur - ttft) if ttft is not None else total_dur

@@ -33,7 +33,18 @@ def queue_retry_time(body: str, now: datetime | None = None) -> datetime | None:
             raw = float(value)
             if not math.isfinite(raw) or raw < 0:
                 continue
-            seconds = raw / 1000 if raw >= 1000 else raw
+            # 秒 / 毫秒判别。
+            #
+            # 原阈值是 `>= 1000`，恰好卡在最糟的位置：`999`（毫秒语义下约 1 秒）
+            # 会被当成 999 **秒** —— 账号凭空冷却 16.6 分钟，号池可用量骤减；
+            # 反向地，任何 ≥1000 的**秒**值（>16.6 分钟）又会被压成千分之一。
+            #
+            # 实测上游的 retry_after：小值（几秒级）是秒，大值（十几万以上）
+            # 才是毫秒时间戳。二者之间没有真实分布，所以把阈值提高到 100000：
+            # 低于它一律按秒（与 reset_from_headers 对 Retry-After 的处理一致），
+            # 高于它才按毫秒折算。这样 999 正确得到 999 秒（=16.6 分钟，
+            # 仍是保守的等待，不会误放开限流），而 150000 得到 150 秒。
+            seconds = raw / 1000 if raw >= 100000 else raw
             if seconds <= 7 * 86400:
                 return now + timedelta(seconds=max(1, seconds))
         except (ValueError, TypeError):

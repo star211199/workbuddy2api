@@ -27,7 +27,7 @@ from admin.models import Account, AccountModelCooldown, ApiKey, ModelConfig, Usa
 from admin.routers.models import _is_model_allowed
 from admin.security import check_quota, get_key_row
 from admin.pool import POOL
-from upstream_compat import normalize_tool_choice
+from upstream_compat import normalize_tool_choice, prepare_upstream_body
 
 HTTP_LIMITS = backend.HTTP_LIMITS
 
@@ -354,7 +354,13 @@ def _fetch_real_credits(log_id: int, account_id: int, auth_json: str, model: str
     """
     try:
         time.sleep(60)
-        sess = AccountSession(auth_json)
+        # 必须带 `backend.` 前缀：本模块只 `from admin import backend`，
+        # 裸名 `AccountSession` 从未绑定 —— 会抛 NameError，被下面的
+        # `except Exception` 吞掉，表现为「真实积分回写**永远**失败」，
+        # 只留一行 "真实积分回写失败 log=...: name 'AccountSession' is not defined"。
+        # 而这条链路只在 credits 是**估算**出来的（上游没回传 usage.credits）
+        # 时才会触发，正是最需要校正的场景。
+        sess = backend.AccountSession(auth_json)
         try:
             start = (created_at - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
             end = (created_at + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
@@ -1396,12 +1402,31 @@ async def _blocking_call(fn, *args, on_cancel=None):
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
+        # ⚠️ `CancelledError` 继承 **BaseException** 而不是 Exception。
+        # 原来这里写 `except Exception: pass`，于是「取消两次」（客户端断连后
+        # 紧接着 scope teardown / 停机）时，第二次取消会从 shield(task) 里
+        # 直接抛出、绕过 on_cancel —— AccountSession 永不 close()，
+        # 而它的临时文件里是**明文 accessToken/refreshToken**（见 backend.py）。
+        # 实测：on_cancel 未被调用、session.closed == False。
+        # 因此这里必须兜 BaseException，并在 finally 里无条件收尾。
+        result = None
         try:
             result = await asyncio.shield(task)
+        except BaseException:
+            # 第二次取消 / shield 失败：仍然要把已经拿到的结果收掉。
+            # `task` 可能已经完成，用 done() 判断，避免 await 再次被取消。
+            if task.done() and not task.cancelled():
+                try:
+                    result = task.result()
+                except BaseException:
+                    result = None
+        finally:
             if on_cancel is not None and result is not None:
-                on_cancel(result)
-        except Exception:
-            pass
+                try:
+                    on_cancel(result)
+                except Exception:
+                    logging.getLogger("admin.proxy").exception(
+                        "on_cancel 清理失败（可能泄漏 AccountSession 临时文件）")
         raise
 
 
@@ -1842,15 +1867,19 @@ def _aggregate_chat_sse(sse_text: str) -> dict:
       * `usage` 取最后一个出现的事件
       * 兼容上游偶发回 `message` 而非 `delta` 的形态
     """
-    content_parts: list[str] = []
-    reasoning_parts: list[str] = []
-    tool_calls: dict[int, dict] = {}
+    # 按 choice.index 分组聚合 —— 上游可以返回多个候选（n>1），
+    # 原实现把所有 choice 的内容拼进**同一个** message，并且固定只输出
+    # `index: 0` 一个 choice，等于把第 2 个及以后的候选**静默丢掉**。
+    choices_acc: dict[int, dict] = {}
     model: str | None = None
-    finish_reason: str | None = None
     usage: dict | None = None
-    saw_content_delta = False
     created = None
     resp_id = ""
+
+    def _slot(i: int) -> dict:
+        return choices_acc.setdefault(
+            i, {"content": [], "reasoning": [], "tool_calls": {},
+                "finish_reason": None})
 
     for line in sse_text.splitlines():
         line = line.strip()
@@ -1870,27 +1899,43 @@ def _aggregate_chat_sse(sse_text: str) -> dict:
         created = chunk.get("created") or created
         if isinstance(chunk.get("usage"), dict):
             usage = chunk["usage"]
-        for choice in (chunk.get("choices") or []):
+        for pos, choice in enumerate(chunk.get("choices") or []):
             if not isinstance(choice, dict):
                 continue
+            try:
+                ci = int(choice.get("index", pos))
+            except (TypeError, ValueError):
+                ci = pos
+            acc = _slot(ci)
             if choice.get("finish_reason"):
-                finish_reason = choice["finish_reason"]
+                acc["finish_reason"] = choice["finish_reason"]
             delta = choice.get("delta") or {}
-            if delta.get("content"):
-                content_parts.append(delta["content"])
-                saw_content_delta = True
+            has_delta_content = bool(delta.get("content"))
+            if has_delta_content:
+                acc["content"].append(delta["content"])
             if delta.get("reasoning_content"):
-                reasoning_parts.append(delta["reasoning_content"])
+                acc["reasoning"].append(delta["reasoning_content"])
             msg = choice.get("message") or {}
-            if not saw_content_delta and msg.get("content"):
-                content_parts.append(msg["content"])
-            if not reasoning_parts and msg.get("reasoning_content"):
-                reasoning_parts.append(msg["reasoning_content"])
+            # ⚠️ 关键：判断「是否该用 message.content 回退」必须看**本 choice
+            # 在这一帧里有没有 delta.content**，而不是看整条流历史。
+            #
+            # 原实现用一个在 choice 循环**之外**的 `saw_content_delta` 标志，
+            # 一旦置位就再也不重置，于是同一条流里后续所有
+            # `message.content` 形态全被丢弃。实测：
+            #   delta:"AAA" 后接 message:"BBB"  ->  得到 'AAA'，BBB 消失，
+            # 且**不报错** —— 非流式调用方拿到被截断的回答却毫无察觉。
+            # 上游偶发回 `message` 形态正是本函数注释声明要兼容的场景。
+            # 现在的语义：同一帧内 delta 与 message 二选一（delta 优先），
+            # 不同帧各自累积。
+            if not has_delta_content and msg.get("content"):
+                acc["content"].append(msg["content"])
+            if not acc["reasoning"] and msg.get("reasoning_content"):
+                acc["reasoning"].append(msg["reasoning_content"])
             for tc in (delta.get("tool_calls") or msg.get("tool_calls") or []):
                 if not isinstance(tc, dict):
                     continue
                 idx = tc.get("index", 0)
-                slot = tool_calls.setdefault(
+                slot = acc["tool_calls"].setdefault(
                     idx, {"id": None, "name": None, "arguments": ""})
                 if tc.get("id"):
                     slot["id"] = tc["id"]
@@ -1900,30 +1945,37 @@ def _aggregate_chat_sse(sse_text: str) -> dict:
                 if fn.get("arguments"):
                     slot["arguments"] += fn["arguments"]
 
-    tcs = None
-    if tool_calls:
-        tcs = [
-            {"id": v["id"], "type": "function",
-             "function": {"name": v["name"], "arguments": v["arguments"]}}
-            for _, v in sorted(tool_calls.items())
-        ]
-        finish_reason = finish_reason or "tool_calls"
+    out_choices = []
+    for ci in sorted(choices_acc):
+        acc = choices_acc[ci]
+        tcs = None
+        if acc["tool_calls"]:
+            tcs = [
+                {"id": v["id"], "type": "function",
+                 "function": {"name": v["name"], "arguments": v["arguments"]}}
+                for _, v in sorted(acc["tool_calls"].items())
+            ]
+        message: dict = {"role": "assistant",
+                         "content": "".join(acc["content"]) or None}
+        if acc["reasoning"]:
+            message["reasoning_content"] = "".join(acc["reasoning"])
+        if tcs:
+            message["tool_calls"] = tcs
+        fr = acc["finish_reason"] or ("tool_calls" if tcs else "stop")
+        out_choices.append({"index": ci, "message": message,
+                            "finish_reason": fr, "logprobs": None})
 
-    message: dict = {"role": "assistant",
-                     "content": "".join(content_parts) or None}
-    if reasoning_parts:
-        message["reasoning_content"] = "".join(reasoning_parts)
-    if tcs:
-        message["tool_calls"] = tcs
+    if not out_choices:
+        out_choices = [{"index": 0,
+                        "message": {"role": "assistant", "content": None},
+                        "finish_reason": "stop", "logprobs": None}]
 
     out: dict = {
         "id": resp_id or f"chatcmpl-{os.urandom(12).hex()}",
         "object": "chat.completion",
         "created": created or int(time.time()),
         "model": model or "",
-        "choices": [{"index": 0, "message": message,
-                     "finish_reason": finish_reason or "stop",
-                     "logprobs": None}],
+        "choices": out_choices,
     }
     if usage is not None:
         out["usage"] = usage
@@ -2095,7 +2147,15 @@ async def chat_completions(
         order = [resolved_model]  # 具体模型：不静默切换，失败即报错
 
     body = dict(payload)
-    body["stream"] = True
+    # 与 /v1/messages、/v1/responses、/gw 共用同一套上游归一：
+    # role 归一、tool_choice 归一、孤儿 tool_call 清理、reasoning 相关处理。
+    # 客户端 body 直接透传时最容易带上上游不认的形态（developer 角色、
+    # 未回结果的 tool_calls），这些都会导致上游 400 甚至会话永久不可用。
+    try:
+        prepare_upstream_body(body, sanitize=False)
+    except Exception as e:
+        _logger.warning("上游请求体归一失败，按原样发送：%s", e)
+
     # 客户端是否要流式。OpenAI SDK 默认 stream=false，所以**不能**假定为 True。
     # 上游只支持流式，因此客户端要非流式时我们先向自己要 SSE、再内部聚合。
     client_wants_stream = bool(payload.get("stream", False))
@@ -2109,7 +2169,9 @@ async def chat_completions(
 
     # 会话粘性键与会话头族在**轮转循环外**算一次，循环内所有尝试复用同一份：
     # 换号重试若换了会话 ID，上游看到的是 N 个并发会话而不是一次对话的一次重试。
-    sticky_key = pool.session_key_for(body)
+    # scope 传当前 API Key 的 id：粘性绑定表是全局命名空间，按 Key 分区才能
+    # 避免不同租户因首条消息相同（如都是 "hi"）而互相钉到同一账号。
+    sticky_key = pool.session_key_for(body, f"k{key.id}")
     session_hdr = _session_headers(body, "")
 
     async def _stream(aggregate: bool = False):
@@ -2506,9 +2568,13 @@ async def chat_completions(
     # 上游只支持流式，所以「非流式」在本网关里意味着「内部聚合」而非
     # 「向上游要非流式」—— 这也正是 admin 侧长期把 SSE 原样吐给
     # stream:false 调用方的原因，属于必须修的协议违约。
-    agg_out = ""
+    agg_chunks: list[str] = []
     async for chunk in _stream(aggregate=True):
-        agg_out = chunk
+        # 累积而不是覆盖：当前实现里聚合模式恰好只 yield 一次，
+        # 但一旦以后新增一条 yield（例如中间态/结束帧），
+        # `agg_out = chunk` 会**静默丢掉前面的内容**且不报错。
+        agg_chunks.append(chunk)
+    agg_out = agg_chunks[-1] if agg_chunks else ""
     if not agg_out:
         return JSONResponse(
             status_code=503,
@@ -2571,10 +2637,12 @@ async def responses_proxy(
 
     chat_body, _stats = project_responses_chat_body(chat_body)
     chat_body.setdefault("model", "auto")
-    chat_body["stream"] = True
-    opts = dict(chat_body.get("stream_options") or {})
-    opts["include_usage"] = True
-    chat_body["stream_options"] = opts
+    # 与 /v1/messages、/gw 共用同一套上游归一（角色/孤儿 tool_call/
+    # tool_choice/reasoning 等），避免 Responses 端点缺少这些修正而 400。
+    try:
+        prepare_upstream_body(chat_body, sanitize=False)
+    except Exception as e:
+        _logger.warning("Responses 上游请求体归一失败，按原样发送：%s", e)
 
     requested = payload.get("model", "auto")
     allowed = _key_group_models(db, key)
@@ -2596,7 +2664,7 @@ async def responses_proxy(
 
     # 会话粘性键与会话头族：在轮转循环外算一次，循环内所有尝试复用同一份
     # （换号重试若换了会话 ID，上游看到的是 N 个并发会话而非一次对话的一次重试）。
-    sticky_key = pool.session_key_for(chat_body)
+    sticky_key = pool.session_key_for(chat_body, f"k{key.id}")
     session_hdr = _session_headers(chat_body, "")
 
     if not client_wants_stream:
@@ -3024,6 +3092,25 @@ async def anthropic_messages(
         except Exception as e:
             _logger.warning("harness 脱敏失败，按原样发送：%s", e)
 
+    # 协议无关的上游改写（与 converter /gw 走**同一套**逻辑）。
+    #
+    # 少了这一步，管理后台端点会缺掉 `/gw` 早已具备的几项关键归一：
+    #   - developer → system 角色归一（上游只认 system，否则 400 code=11101）
+    #   - 孤儿 tool_call 清理（客户端中断后残留的 tool_calls 会让上游 400 code=11150，
+    #     且该会话之后**永久**发不出去）
+    #   - tool_choice 归一
+    #   - reasoning_effort 归一 / reasoning_content 回填
+    # 顺序即语义（见 prepare_upstream_body 的说明），因此在这里统一调用，
+    # 而不是各处手写 chat_body["stream"] = True。
+    #
+    # sanitize 传 False：指纹脱敏已在上面由 desensitize_body 处理，
+    # 重复做会二次改写文本（且 sanitize 会动工具参数，见 upstream_compat 的说明）。
+    try:
+        prepare_upstream_body(chat_body, sanitize=False)
+    except Exception as e:
+        # 归一失败不应让请求整个失败：按未归一的样子发出去，至少可能成功。
+        _logger.warning("上游请求体归一失败，按原样发送：%s", e)
+
     requested = _map_anthropic_model(db, payload.get("model", "auto"), key)
     allowed = _key_group_models(db, key)
     resolved = await _blocking_call(_pick_best_model, db, requested, allowed)
@@ -3053,7 +3140,7 @@ async def anthropic_messages(
     # 这里用**原始 payload** 而非转换后的 chat_body：Anthropic 协议的
     # `metadata.user_id` 只在原 payload 里，用它才能正确触发「已声明用户维度
     # 则不借首条 prompt 建立粘性」的抑制规则。
-    sticky_key = pool.session_key_for(payload)
+    sticky_key = pool.session_key_for(payload, f"k{key.id}")
     session_hdr = _session_headers(payload if isinstance(payload, dict) else {}, "")
 
     if not client_wants_stream:

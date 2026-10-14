@@ -1,6 +1,7 @@
 """账号管理：列表 / 新增 / 批量上传 / 扫描本机 / 导入本机 / 刷新余额 / 启用禁用 / 删除 / 注入本机客户端。"""
 import glob
 import json
+import logging
 import os
 import shutil
 from datetime import datetime, timezone, timedelta
@@ -17,6 +18,13 @@ from admin.config import settings
 from admin.db import SessionLocal, get_db
 from admin.models import Account, AccountModelCooldown, ModelConfig, UsageLog
 from admin.security import require_admin
+
+#: 模块日志器。此前 `_post_login_automation` 的 except 分支调用了 `_logger`
+#: 却从未在本模块定义它 —— `except Exception:` 里抛出的 NameError 会**顶替**
+#: 原始异常并向外逃逸，于是「登录后自动任务失败」这一本该被吞掉的情况，
+#: 反而让调用方（新增/批量新增账号）在 `db.commit()` 之后吃到 500：
+#: 账号其实已入库成功，界面却报失败。
+_logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 

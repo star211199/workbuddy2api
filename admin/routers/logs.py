@@ -242,6 +242,29 @@ def list_logs(
     }
 
 
+#: CSV 公式注入的危险前缀。Excel / LibreOffice / Google Sheets 会把以这些
+#: 字符开头的单元格当**公式**执行（DDE 甚至可以拉起外部程序）。
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value):
+    """防止 CSV 公式注入（CSV injection / formula injection）。
+
+    为什么需要：导出里的 `client_ip`、`model`、`use_case`、Key 名与账号名
+    都是**调用方可控**的（IP 来自请求头，model 来自请求体，名称由管理员填写）。
+    若不处理，攻击者只要把 `model` 设成 `=cmd|' /C calc'!A0`，管理员一导出
+    对账 CSV 并在 Excel 里打开，就在**自己的办公机**上执行了这条公式。
+
+    处理方式：对以危险字符开头的字符串**前置一个单引号** —— 这是 Excel 的
+    「强制当文本」约定，显示时不会出现那个引号，值也不会被求值。
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    if value.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
 @router.get("/export")
 def export_logs(
     key_id: Optional[int] = None,
@@ -295,9 +318,9 @@ def export_logs(
                 t_str = (t + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
             w.writerow([
                 r.id,
-                key_names.get(r.api_key_id) or f"#{r.api_key_id}",
-                acc_names.get(r.account_id) or f"#{r.account_id}",
-                r.model,
+                _csv_safe(key_names.get(r.api_key_id) or f"#{r.api_key_id}"),
+                _csv_safe(acc_names.get(r.account_id) or f"#{r.account_id}"),
+                _csv_safe(r.model),
                 r.credits,
                 r.prompt_tokens if r.prompt_tokens is not None else "",
                 r.completion_tokens if r.completion_tokens is not None else "",
@@ -305,9 +328,9 @@ def export_logs(
                 r.total_tokens if r.total_tokens is not None else "",
                 r.ttfb_ms if r.ttfb_ms is not None else "",
                 r.latency_ms if r.latency_ms is not None else "",
-                r.error_kind or "",
-                r.client_ip or "",
-                r.use_case or "",
+                _csv_safe(r.error_kind or ""),
+                _csv_safe(r.client_ip or ""),
+                _csv_safe(r.use_case or ""),
                 t_str,
             ])
     return Response(

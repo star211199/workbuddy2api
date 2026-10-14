@@ -189,13 +189,35 @@ class GatewayAdmissionMiddleware:
                                       status_code=429, headers={'Retry-After': str(retry)})(scope, receive, send)
         owner = asyncio.current_task()
         async def renew():
+            # ⚠️ 心跳失败**绝不能**直接 cancel 掉正在进行的请求。
+            #
+            # 原实现：`_RENEW` 返回 0（或抛异常被 `except Exception: pass` 吞掉）
+            # 就立刻 `owner.cancel()`，于是：
+            #   1. 只配了并发限制（没配 GATEWAY_RATE_PER_MINUTE）时，记账用的
+            #      ZSET 只能靠**其他流量**刷新 TTL；121 秒内没有新请求，Redis
+            #      就会整个删掉这个 key，`_RENEW` 必然返回 0 ——
+            #      一个健康的 2 分钟长流被**结构性**强杀（不是偶发）。
+            #   2. 一次 Redis 瞬时抖动（ConnectionError / timeout / LOADING）
+            #      同样会让正常请求中途断开。
+            #
+            # 新语义：续期失败只当作「本轮没续上」，让租约自然过期；
+            # 只有**确认已失去租约**（连续多次续期失败）才取消，
+            # 这样既不会误杀长流，也不会在真正失去名额后继续占用。
+            misses = 0
             while True:
                 await asyncio.sleep(30)
                 try:
-                    if await _finish_thread(result.client.eval, _RENEW, 1, _keys(result.key)[1], result.token):
+                    if await _finish_thread(result.client.eval, _RENEW, 1,
+                                            _keys(result.key)[1], result.token):
+                        misses = 0
                         continue
                 except Exception:
+                    # 网络/Redis 抖动：计入 miss，但不立刻杀请求。
                     pass
+                misses += 1
+                if misses < 3:
+                    # 连续 3 次（约 90 秒）都续不上才认为租约真的丢了。
+                    continue
                 owner.cancel()
                 return
         heartbeat = asyncio.create_task(renew()) if result.client is not None else None

@@ -186,6 +186,11 @@ def init_db() -> bool:
         _ensure_index("accounts", "ix_accounts_uid", ("uid",))
         _ensure_index("account_model_cool", "ix_account_model_cool_model_until", ("model", "until"))
 
+        # 迁移：accounts.uid 唯一约束。
+        # 先清理历史重复行（否则建唯一索引会失败），再建索引 —— 顺序不能反。
+        if _dedupe_accounts_by_uid() >= 0:
+            _ensure_unique_index("accounts", "uq_accounts_uid", ("uid",))
+
         # 迁移：创建 system_settings / schedules 表（create_all 已处理，这里仅兜底）
 
     return _retry_db_startup("建表/迁移", _do)
@@ -268,4 +273,104 @@ def _ensure_index(table: str, index: str, columns: tuple[str, ...]) -> bool:
     except Exception as e:
         # 权限不足 / 方言不支持 / 并发建索引冲突：都不该让服务启动失败
         logger.warning("创建索引 %s 失败（不影响启动）：%s", index, e)
+        return False
+
+
+def _dedupe_accounts_by_uid() -> int:
+    """为 `accounts.uid` 建唯一约束前，先合并历史重复行。
+
+    为什么需要去重：老库在「无唯一约束」时期可能已经写入了重复 uid
+    （多进程 uvicorn / 双实例共享同库）。直接 `CREATE UNIQUE INDEX` 会失败，
+    唯一约束永远建不上 —— 所以先把重复行清掉再建。
+
+    保留策略：保留 **id 最小**（最早录入）的那一行，其余删除。
+    这些重复行正是「孤儿号」：`_find_dup` 只返回第一条，第二条仍会被选号、
+    持续消耗同一份积分，因此删除它们是修复而非数据损失。
+    返回删除的行数。
+    """
+    try:
+        with engine.begin() as conn:
+            if engine.dialect.name == "sqlite":
+                rows = conn.execute(text(
+                    "SELECT uid, COUNT(*) c FROM accounts "
+                    "WHERE uid IS NOT NULL AND uid != '' "
+                    "GROUP BY uid HAVING c > 1")).fetchall()
+                removed = 0
+                for uid, _c in rows:
+                    keep_id = conn.execute(text(
+                        "SELECT MIN(id) FROM accounts WHERE uid = :u"),
+                        {"u": uid}).scalar()
+                    res = conn.execute(text(
+                        "DELETE FROM accounts WHERE uid = :u AND id != :k"),
+                        {"u": uid, "k": keep_id})
+                    removed += res.rowcount or 0
+            else:
+                # MySQL：唯一索引允许多个 NULL，但**不允许**多个 ''。
+                # 先把空 uid 归一成 NULL，否则第二个「无 uid 账号」会被拒。
+                conn.execute(text(
+                    "UPDATE accounts SET uid = NULL WHERE uid = ''"))
+                res = conn.execute(text(
+                    "DELETE a FROM accounts a JOIN accounts b "
+                    "ON a.uid = b.uid AND a.id > b.id "
+                    "WHERE a.uid IS NOT NULL AND a.uid != ''"))
+                removed = res.rowcount or 0
+        if removed:
+            logger.warning("已清理 %d 条重复 uid 的账号行（保留最早的记录）", removed)
+        return removed
+    except Exception as e:
+        logger.warning("重复账号清理失败（跳过唯一约束）：%s", e)
+        return -1
+
+
+def _ensure_unique_index(table: str, index: str, columns: tuple[str, ...]) -> bool:
+    """确保**唯一**索引存在（幂等）。
+
+    为什么需要：`admin/routers/login.py` 的注释自己承认「多进程部署时仍需要
+    数据库唯一索引兜底」，但 DB 层此前**根本没有任何唯一约束**（全库 0 个）。
+    于是两个进程同时登录同一账号会各插一行，`_find_dup` 只认第一条，
+    第二条成为**永远清不掉的孤儿号**：它照常参与选号、照常扣同一份积分。
+
+    与 `_ensure_index` 的差别只有 `UNIQUE` 关键字；同样经 `_safe_ident`
+    白名单校验，失败时静默降级（不影响启动）。
+    """
+    if not columns:
+        return False
+    try:
+        if engine.dialect.name == "sqlite":
+            with engine.begin() as conn:
+                cols = ", ".join(f'"{_safe_ident(c)}"' for c in columns)
+                # 部分唯一索引：只约束**非空**的 uid。
+                # 为什么必须这样：`accounts.uid` 允许为空（还没解析出 uid 的
+                # 账号），而 SQL 里多个 '' 会互相冲突 —— 普通唯一索引会直接
+                # 让第二个空 uid 账号插不进去（实测 UNIQUE constraint failed）。
+                # MySQL 的唯一索引本身就允许多个 NULL，但**不允许**多个 ''，
+                # 所以两边都要排除空串。
+                conn.execute(text(
+                    f'CREATE UNIQUE INDEX IF NOT EXISTS "{_safe_ident(index)}" '
+                    f'ON "{_safe_ident(table)}" ({cols}) '
+                    f"WHERE {_safe_ident(columns[0])} IS NOT NULL "
+                    f"AND {_safe_ident(columns[0])} != ''"))
+            return True
+        with engine.connect() as conn:
+            exists = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS "
+                    "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=:tbl AND INDEX_NAME=:idx"
+                ),
+                {"tbl": table, "idx": index},
+            ).scalar() or 0
+            if exists:
+                return False
+            cols = ", ".join(f"`{_safe_ident(c)}`" for c in columns)
+            # MySQL 8 支持函数索引，但更稳妥的做法是：唯一索引 + 插入前把
+            # 空 uid 视为 NULL（MySQL 唯一索引允许多个 NULL）。
+            conn.execute(
+                text(f"CREATE UNIQUE INDEX `{_safe_ident(index)}` "
+                     f"ON `{_safe_ident(table)}` ({cols})")
+            )
+            conn.commit()
+            logger.info("已创建唯一索引 %s(%s)", index, ",".join(columns))
+            return True
+    except Exception as e:
+        logger.warning("创建唯一索引 %s 失败（不影响启动）：%s", index, e)
         return False

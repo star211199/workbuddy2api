@@ -23,7 +23,16 @@ hidden += ['uvicorn.logging', 'uvicorn.loops.asyncio', 'uvicorn.protocols.http.h
 a = Analysis([str(root / 'desktop_entry.py')], pathex=[str(root)], datas=datas, hiddenimports=hidden,
              excludes=['tkinter', 'PyQt5', 'PyQt6', 'PySide2', 'PySide6', 'cefpython3',
                        'cairosvg', 'resvg_py', 'PIL', 'numpy', 'scipy', 'matplotlib', 'pytest',
-                       'IPython', 'watchfiles', 'websockets', 'httptools'], noarchive=False)
+                       'IPython', 'watchfiles', 'websockets', 'httptools',
+                       # 排除 setuptools / pkg_resources：
+                       # proxy_tools（pywebview 的依赖）会把它带进来，触发 PyInstaller 的
+                       # `pyi_rth_pkgres` 运行时钩子，而该钩子在 `jaraco.text` 里
+                       # `import jaraco.context` → 需要 `backports` 命名空间包，
+                       # 打出来的 EXE 于是**双击即崩**：
+                       #   ModuleNotFoundError: No module named 'backports'
+                       # 本项目从不使用 pkg_resources（仅构建期工具依赖），
+                       # 因此直接排除，连带去掉那个运行时钩子。
+                       'setuptools', 'pkg_resources', '_distutils_hack'], noarchive=False)
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name=name, debug=False,
           bootloader_ignore_signals=False, strip=False, upx=False, console=False,

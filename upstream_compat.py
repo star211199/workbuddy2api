@@ -317,20 +317,26 @@ def cleanup_orphan_tool_calls(obj: dict) -> int:
     keep = call_ids & result_ids
     changed = 0
 
-    # 4. assistant：tool_calls 全有配对才保留，否则删整个键
+    # 4. assistant：**逐条**剔除没有配对的 tool_call，而不是整条 tool_calls 一起删。
+    #
+    # 原实现是 all-or-nothing（任一 tool_call 缺配对就 pop 整个键）。后果：
+    # 模型一次发起 A、B 两个并行调用、结果**分批回传**（这是 Codex/Claude Code
+    # 的正常行为），当只有 A 回来时，A 明明是**完全合法且已配对**的调用，
+    # 却连同它的结果一起被删除 —— 模型上下文凭空少一轮工具往返，
+    # 可能重复执行已完成的动作（重复写文件 / 重复提交）。
     for m in msgs:
         if not isinstance(m, dict) or m.get("role") != "assistant":
             continue
         tcs = m.get("tool_calls")
         if not isinstance(tcs, list) or not tcs:
             continue
-        keep_all = True
-        for tc in tcs:
-            if not isinstance(tc, dict) or tc.get("id") not in keep:
-                keep_all = False
-                break
-        if not keep_all:
-            m.pop("tool_calls", None)
+        pruned = [tc for tc in tcs
+                  if isinstance(tc, dict) and tc.get("id") in keep]
+        if len(pruned) != len(tcs):
+            if pruned:
+                m["tool_calls"] = pruned
+            else:
+                m.pop("tool_calls", None)
             changed += 1
 
     # 5. 重算存活 call 集：第 4 步删掉的 tool_calls 里的 id 不能再算配对成功，
@@ -740,15 +746,18 @@ def sanitize_messages(obj: dict) -> int:
                 touched = True
         tcs = m.get("tool_calls")
         if isinstance(tcs, list):
-            for tc in tcs:
-                if not isinstance(tc, dict):
-                    continue
-                fn = tc.get("function")
-                if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
-                    new = sanitize_text(fn["arguments"])
-                    if new != fn["arguments"]:
-                        fn["arguments"] = new
-                        touched = True
+            # ⚠️ **不要**对 `function.arguments` 做 sanitize_text。
+            #
+            # arguments 是**会被真正执行的载荷**（命令行、文件路径、查询串），
+            # 不是自然语言模板。对它做关键词改写会把语义改掉，而且 JSON 依旧合法、
+            # 不报错、无人察觉：
+            #   {"command": "grep -n 11128 app.log"}      -> "grep -n 11-128 app.log"
+            #   {"cmd": "x-anthropic-billing-header: a;cc_entrypoint=cli; run"} -> "; run"
+            #   {"path": "docs/11128-notes.md"}           -> "docs/11-128-notes.md"
+            # 工具会去查一个不存在的东西，返回「无匹配」时看起来像正常结果 ——
+            # 属静默数据破坏。上游审核针对的是 system/harness 模板文本，
+            # 这些参数不在其列。
+            pass
         if touched:
             n += 1
     return n

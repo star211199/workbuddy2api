@@ -8,6 +8,7 @@
   - sync_models：从后端拉取最新模型列表并 upsert 倍率
 """
 import json
+import logging
 import threading
 import time
 from datetime import datetime, timedelta
@@ -15,6 +16,8 @@ from datetime import datetime, timedelta
 from admin.db import SessionLocal
 from admin.models import Schedule
 from admin.config import settings
+
+_logger = logging.getLogger(__name__)
 
 #: 账号间保活节流间隔（秒），从配置读取，缺省 0.8。
 _KEEPALIVE_ACCOUNT_GAP = settings.KEEPALIVE_ACCOUNT_GAP
@@ -679,10 +682,14 @@ def _loop():
                 if s.next_run_at is None or s.next_run_at <= now:
                     _run_one(s, db, now)
         except Exception:
-            # 数据库短暂不可用（如 MySQL 重启）时静默跳过本轮，下一轮再试。
+            # 数据库短暂不可用（如 MySQL 重启）时跳过本轮，下一轮再试。
             # 原先的写法在 `SessionLocal()` 本身抛异常时会引用未赋值的 db，
             # 让异常从 except 块里再次抛出并终止调度线程。
-            pass
+            #
+            # ⚠️ 但**必须记日志**：原来这里是纯 `pass`，于是整个 tick 失败
+            # （含 _run_one 里的 db.commit() 抛错）在日志里零痕迹，
+            # 运维只能靠「任务莫名不跑」反推。可观测性和不中断同等重要。
+            _logger.exception("调度轮次执行失败（本轮跳过，15 秒后重试）")
         finally:
             if db is not None:
                 try:

@@ -8,6 +8,7 @@
   可行的任务发包，其余标记为需人工，避免盲目请求污染上游日志。
 * **串行 + 限速**：逐个账号、逐个任务执行，中间 sleep，避免触发风控。
 """
+import logging
 import time
 from datetime import datetime
 
@@ -20,6 +21,12 @@ from admin.config import settings
 from admin.db import SessionLocal, get_db
 from admin.models import Account
 from admin.security import require_admin
+
+#: 模块日志器。此前 `run_accounts` 的两处 `_logger` 调用（门槛清除成功日志、
+#: 未确认解锁告警）从未在本模块定义 —— 那两处都在 `try` 里，抛出的 NameError
+#: 会被随后的 `except Exception` 吞掉，于是**门槛明明清除成功却被记成失败**，
+#: 并让代码继续按"未解锁"走 12 秒轮询。
+_logger = logging.getLogger(__name__)
 
 # ⚠️ 必须整组挂 require_admin（安全审计「严重」项）。
 # 历史实现的这个 router **一个鉴权依赖都没有**，于是：

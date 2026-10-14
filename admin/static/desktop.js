@@ -110,10 +110,21 @@ window.WBDesktop = (() => {
       polling = true;
       try {
         const result = await pywebview.api.update_status();
-        document.getElementById('wbUpdateStatus').textContent = result.message;
-        document.getElementById('wbRuntimeStatus').textContent = result.runtime;
-        document.getElementById('wbUpdateInstall').hidden = !result.ready;
+        // 空值保护：dialog 被关闭/重新渲染后，这些节点可能已不在 DOM 里，
+        // 直接取 .textContent 会抛 TypeError（在 interval 回调里表现为
+        // unhandled rejection，且每秒复现一次）。
+        const setText = (id, value) => {
+          const el = document.getElementById(id);
+          if (el) el.textContent = value == null ? '' : value;
+        };
+        setText('wbUpdateStatus', result.message);
+        setText('wbRuntimeStatus', result.runtime);
+        const installBtn = document.getElementById('wbUpdateInstall');
+        if (installBtn) installBtn.hidden = !result.ready;
         if (releases) releases.update = result;
+      } catch (e) {
+        // 原生桥接短暂不可用时不打断轮询，但也不再冒泡成 unhandled rejection。
+        console.warn('更新状态轮询失败：', e);
       } finally { polling = false; }
     }, 1000);
   }

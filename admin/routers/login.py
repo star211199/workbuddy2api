@@ -25,6 +25,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
@@ -38,7 +39,7 @@ from sqlalchemy.orm import Session
 from admin import wb_login
 from admin.db import get_db
 from admin.models import Account
-from admin.ratelimit import get_client_ip
+from admin.ratelimit import get_client_ip, get_trusted_client_ip
 from admin.security import require_admin
 
 _logger = logging.getLogger("admin.wb_login_router")
@@ -51,6 +52,8 @@ public_router = APIRouter(tags=["join"])
 SMS_MIN_INTERVAL = 60
 #: 同一 IP 每小时最多发码次数（防有人拿我们的出口 IP 刷短信）。
 SMS_MAX_PER_HOUR = 10
+#: 节流表的条目上限：超过就清理已彻底过期的键，防止无限增长（见 `_check_sms_quota`）。
+_SMS_TABLE_MAX = 5000
 
 #: 发码节流表。
 #:   ip -> [时间戳...]        按小时封顶
@@ -66,11 +69,38 @@ _sms_mobile_last: dict[str, float] = {}
 _sms_lock = threading.Lock()
 
 
-def _check_sms_quota(ip: str, mobile: str = "") -> None:
+def _trusted_ip(request: Request) -> str:
+    """取**客户端无法伪造**的来源 IP，用于短信配额这类安全判定。
+
+    与登录锁定（admin/server.py 的 /api/login）保持同一口径：
+    `get_client_ip` 取 XFF **首段**，而 nginx 的 `$proxy_add_x_forwarded_for`
+    是追加语义 —— 客户端自带的假值恰好排在首位，取首段等于放行无限配额。
+    这里改取 `X-Real-IP` / XFF **最后一段** / 直连地址。
+    """
+    return get_trusted_client_ip(
+        request.headers.get("x-real-ip"),
+        request.headers.get("x-forwarded-for"),
+        request.client.host if request.client else None,
+    )
+
+
+def _check_sms_quota(ip: str, mobile: str = "") -> float:
     """发码节流。超限直接 429。
 
     * `mobile` 非空时按号码限 60 秒间隔；
     * 任意情况下按 IP 限每小时 `SMS_MAX_PER_HOUR` 次。
+
+    设计要点：这里**只记 IP 计数**，号码冷却由 `_note_sms_sent()` 在
+    **确认短信发出之后**才写入。
+
+    为什么不能在这里就写号码冷却：那样失败归还就必然要把冷却删掉
+    （否则用户一次网络抖动要白等 60 秒），而"删掉冷却"正好可被利用 ——
+    攻击者对同一号码反复发**必然失败**的请求，每次失败都清掉冷却，
+    60 秒间隔形同虚设（公开端点 /api/join/send 无需登录即可打）。
+    把写入推迟到成功后，失败路径**从不碰冷却**：既没有可用性问题，
+    也堵住了绕过。
+
+    返回本次计入的时间戳，供失败时 `_refund_sms_quota` 精确回收 IP 计数。
     """
     now = time.time()
     with _sms_lock:
@@ -88,19 +118,74 @@ def _check_sms_quota(ip: str, mobile: str = "") -> None:
                                 detail="本小时发送次数已达上限，请稍后再试")
         hits.append(now)
         _sms_log[ip] = hits
-        if mobile:
-            _sms_mobile_last[mobile] = now
+
+        _prune_sms_tables_locked(now)
+        return now
 
 
-def _refund_sms_quota(ip: str, mobile: str = "") -> None:
-    """发码失败时归还配额 —— 否则用户手滑几次就被自己锁死。"""
+def _note_sms_sent(mobile: str) -> None:
+    """短信**确实发出后**才记录号码冷却（见 `_check_sms_quota` 的说明）。"""
+    if not mobile:
+        return
+    now = time.time()
     with _sms_lock:
-        hits = _sms_log.get(ip) or []
+        _sms_mobile_last[mobile] = now
+        _prune_sms_tables_locked(now)
+
+
+def _prune_sms_tables_locked(now: float) -> None:
+    """清理过期节流条目，并保证两张表不超过容量上限。调用方须持 `_sms_lock`。
+
+    公开注册页（/api/join/send）任何人都能打，IP 与手机号都是攻击者可无限
+    制造的新键。原来两张表**只增不减**，是真实的慢速内存泄漏。
+    注意只删"已过期"键在全是新鲜键时删不掉几个，所以额外做容量兜底裁剪。
+    """
+    if len(_sms_log) > _SMS_TABLE_MAX:
+        for k in [k for k, v in _sms_log.items()
+                  if not any(now - t < 3600 for t in v)]:
+            _sms_log.pop(k, None)
+        if len(_sms_log) > _SMS_TABLE_MAX:
+            for k in sorted(_sms_log, key=lambda k: max(_sms_log[k]) or 0):
+                if len(_sms_log) <= _SMS_TABLE_MAX:
+                    break
+                _sms_log.pop(k, None)
+    if len(_sms_mobile_last) > _SMS_TABLE_MAX:
+        for k in [k for k, t in _sms_mobile_last.items()
+                  if now - t >= SMS_MIN_INTERVAL]:
+            _sms_mobile_last.pop(k, None)
+        if len(_sms_mobile_last) > _SMS_TABLE_MAX:
+            for k in sorted(_sms_mobile_last, key=lambda k: _sms_mobile_last[k]):
+                if len(_sms_mobile_last) <= _SMS_TABLE_MAX:
+                    break
+                _sms_mobile_last.pop(k, None)
+
+
+def _refund_sms_quota(ip: str, mobile: str = "", issued_at: float | None = None) -> None:
+    """发码失败时归还配额 —— 否则用户手滑几次就被自己锁死。
+
+    ⚠️ 两点与原实现不同：
+
+    1. **完全不碰 mobile 的 60 秒冷却**。
+       冷却现在只在短信**确实发出后**由 `_note_sms_sent()` 写入，
+       所以失败路径本来就没有它的份。这样"失败→归还→立刻再发"无法绕过间隔，
+       IP 计数又能正常归还（用户不会因网络抖动被自己的配额锁死）。
+       两处合并的效果：既没有可用性问题，也没有绕过面。
+
+    2. IP 计数精确删除本次记入的**那个时间戳**，而不是 `pop()` 弹栈顶。
+       原来弹的是列表末尾（最新一笔），与本次请求未必对应；
+       并发下可能把别人的配额还掉。
+    """
+    with _sms_lock:
+        hits = _sms_log.get(ip)
         if hits:
-            hits.pop()
-            _sms_log[ip] = hits
-        if mobile:
-            _sms_mobile_last.pop(mobile, None)
+            if issued_at is not None and issued_at in hits:
+                hits.remove(issued_at)
+            else:
+                hits.pop()
+            if hits:
+                _sms_log[ip] = hits
+            else:
+                _sms_log.pop(ip, None)
 
 
 class StartOut(BaseModel):
@@ -204,36 +289,46 @@ def _store_verified_credential(credential: str, meta: dict, db: Session) -> dict
     # 用进程内锁按 uid 串行即可：本服务是单进程（main.py 起一个 uvicorn），
     # 多进程部署时仍需要数据库唯一索引兜底（DB 层加约束需要迁移，
     # 这里先在应用层堵住；`_find_dup` 也会兜住历史重复数据）。
-    _uid_lock = _uid_write_lock(uid)
-    with _uid_lock:
+    with _uid_write_lock(uid):
         return _store_locked(credential, meta, balance, uid, db,
                              live_ok, live_msg)
 
 
-_uid_locks: dict[str, threading.Lock] = {}
+_uid_locks: dict[str, list] = {}   # key -> [Lock, refcount]
 _uid_locks_guard = threading.Lock()
 
 
-def _uid_write_lock(uid: str) -> threading.Lock:
-    """取（或建）该 uid 专属的写锁。
+@contextlib.contextmanager
+def _uid_write_lock(uid: str):
+    """按 uid 串行化「查重 + 写入/更新」。
 
-    uid 为空时返回一把全局共享锁 —— 没有 uid 就没法区分账号，
-    只能串行（这种情况本来就该拒绝，见上游验证的 uid 校验）。
+    ⚠️ 这里**不能**用「取锁 → 非阻塞探测 → pop 掉没人持有的锁」那种淘汰法：
+    线程 A 可能已经拿到锁对象 L 但**还没** `with L`，此时淘汰遍历探测到 L
+    未被持有就把它从字典里 pop 掉；线程 C 再取同一 uid 会拿到**全新的 L2**，
+    于是 A 持 L、C 持 L2 同时进入 `_store_locked` —— 去重逻辑（先 SELECT
+    再 INSERT）形同虚设，又回到注释里那个「8 并发注册建出 6 条重复记录」的故障。
+
+    现在改为**引用计数**：只要有人取用过，锁对象在被安全释放之前不会被换掉；
+    计数归零才从表中移除。表大小因此天然有界（等于"同时在写的 uid 数"）。
     """
     key = uid or "__no_uid__"
     with _uid_locks_guard:
-        lk = _uid_locks.get(key)
-        if lk is None:
-            lk = threading.Lock()
-            _uid_locks[key] = lk
-        # 简单防膨胀：锁对象很小，但 uid 无限增长时仍会堆积。
-        # 超过阈值就清理「当前没人持有」的锁（acquire 非阻塞探测）。
-        if len(_uid_locks) > 2000:
-            for k in list(_uid_locks):
-                if k != key and _uid_locks[k].acquire(blocking=False):
-                    _uid_locks[k].release()
-                    _uid_locks.pop(k, None)
-        return lk
+        entry = _uid_locks.get(key)
+        if entry is None:
+            entry = [threading.Lock(), 0]
+            _uid_locks[key] = entry
+        entry[1] += 1          # 占用计数：保证取出后不会被淘汰
+        lock = entry[0]
+    try:
+        with lock:
+            yield lock
+    finally:
+        with _uid_locks_guard:
+            entry[1] -= 1
+            # 无人使用且锁未被持有 → 安全移除（不会误删别人手上的锁）
+            if entry[1] <= 0 and not lock.locked():
+                if _uid_locks.get(key) is entry:
+                    _uid_locks.pop(key, None)
 
 
 def _store_locked(credential: str, meta: dict, balance: dict, uid: str,
@@ -337,16 +432,31 @@ def login_start(_: bool = Depends(require_admin)):
 @router.post("/send")
 def login_send(body: SendIn, request: Request, _: bool = Depends(require_admin)):
     """第 2 步：给指定手机号发验证码。"""
-    ip = get_client_ip(request.headers.get("x-forwarded-for"), request.client.host
-                       if request.client else None)
+    # 必须用**不可伪造**的来源 IP：XFF 首段是客户端可随便写的，而 nginx 的
+    # `$proxy_add_x_forwarded_for` 是**追加**语义，假值恰好排在首位 ——
+    # 用 `get_client_ip` 就等于「每次换一个假 IP 就能绕开小时配额」，
+    # 短信配额形同虚设（真金白银的短信被刷）。登录锁定早已改用
+    # `get_trusted_client_ip`，这里此前漏改。
+    ip = _trusted_ip(request)
     mobile = wb_login.normalize_mobile(body.mobile)
-    _check_sms_quota(ip, mobile)
+    _sms_issued_at = _check_sms_quota(ip, mobile)
     try:
         sess = wb_login.get_session(body.sid)
         out = wb_login.send_sms(sess, body.mobile)
+    except HTTPException:
+        # 会话无效等 HTTP 异常同样没发出去 —— 归还配额
+        _refund_sms_quota(ip, mobile, _sms_issued_at)
+        raise
+    except Exception:
+        # 任何非 WbLoginError 的异常（如 httpx 底层错误）此前**不归还配额**，
+        # 于是几次网络抖动就把用户自己的小时配额吃光，且再也等不回来。
+        _refund_sms_quota(ip, mobile, _sms_issued_at)
+        raise
     except wb_login.WbLoginError as e:
-        _refund_sms_quota(ip, mobile)
+        _refund_sms_quota(ip, mobile, _sms_issued_at)
         raise _fail(e, 502)
+    # 短信确实发出去了：此刻才记录号码冷却（见 _check_sms_quota 的说明）。
+    _note_sms_sent(mobile)
     return {"ok": True, "expires_in": out.get("expires_in", 60)}
 
 
@@ -634,21 +744,26 @@ def join_start(body: JoinIn, request: Request):
 @public_router.post("/api/join/send")
 def join_send(body: JoinIn, request: Request):
     """公开：发短信验证码。"""
-    ip = get_client_ip(request.headers.get("x-forwarded-for"),
-                       request.client.host if request.client else None)
+    ip = _trusted_ip(request)
     mobile = wb_login.normalize_mobile(body.mobile)
-    _check_sms_quota(ip, mobile)
+    _sms_issued_at = _check_sms_quota(ip, mobile)
     try:
         sess = wb_login.get_session(body.sid)
         with _upstream_slot("send"):
             out = wb_login.send_sms(sess, body.mobile)
     except wb_login.WbLoginError as e:
-        _refund_sms_quota(ip, mobile)
+        _refund_sms_quota(ip, mobile, _sms_issued_at)
         raise _fail(e, 502)
     except HTTPException:
         # 忙 -> 归还配额（其实没发出去），503 透给前端
-        _refund_sms_quota(ip, mobile)
+        _refund_sms_quota(ip, mobile, _sms_issued_at)
         raise
+    except Exception:
+        # 其它异常同样没发出去，配额必须还回去（否则网络抖动会吃光配额）
+        _refund_sms_quota(ip, mobile, _sms_issued_at)
+        raise
+    # 确实发出去了：此刻才记录号码冷却（防轰炸的唯一号码级防线）。
+    _note_sms_sent(mobile)
     return {"ok": True, "expires_in": out.get("expires_in", 60)}
 
 

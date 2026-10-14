@@ -98,9 +98,20 @@ class Job:
         self.phase = phase
 
     def snapshot(self) -> dict:
-        """给前端的进度快照（不含内部字段）。"""
+        """给前端的进度快照（不含内部字段）。
+
+        持锁读取：`add_item` / `beat` 是在锁内写这些字段的，
+        不加锁会读到撕裂状态（如 items 已 append、done 还没更新）。
+        """
+        with self._lock:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> dict:
         elapsed = ((self.finished_at or datetime.utcnow())
                    - self.started_at).total_seconds()
+        # percent 必须截断到 100：total 可能在运行期被上调/下调
+        # （app_source 会改写 job.total），而 done 只增不减，否则会出现 166% 这种值。
+        percent = int(self.done / self.total * 100) if self.total else 0
         return {
             "job_id": self.id,
             "key": self.key,
@@ -110,7 +121,7 @@ class Job:
             "total": self.total,
             "done": self.done,
             "elapsed_s": round(elapsed, 1),
-            "percent": int(self.done / self.total * 100) if self.total else 0,
+            "percent": max(0, min(100, percent)),
             "current": self.current,
             "task_done": self.task_done,
             "task_current": self.task_current,
@@ -157,14 +168,24 @@ class JobRunner:
 
     def start(self, key: str, total: int, worker: Callable[[Job], dict],
               title: str = "") -> Job:
-        """启动一个后台任务。
+        """启动一个后台任务。**同 key 已在跑时直接复用既有 Job**。
 
         worker 收到 Job，负责逐个处理并调用 job.add_item() 上报进度，
         返回值会作为 job.result 存下来。
+
+        为什么要在锁内做「检查 + 复用」：调用方普遍是「先 get() 判断在跑、再 start()」
+        的无锁 check-then-act（accounts/growth/app_source 都是这个写法），
+        两次并发点击可以同时通过检查；若这里直接覆盖 `_jobs[key]`，
+        第一个 Job 会变成幽灵 —— 仍在跑（重复打上游）、但进度与结果
+        **永远取不到**（by_id 也查不到，因为字典里只剩第二个）。
+        这里把判重收进锁内，使 start() 自身成为原子操作。
         """
-        job = Job(key, total, title=title)
         with self._lock:
             self._purge_locked()
+            existing = self._jobs.get(key)
+            if existing is not None and existing.status == "running":
+                return existing
+            job = Job(key, total, title=title)
             self._jobs[key] = job
 
         def _run() -> None:

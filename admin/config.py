@@ -10,6 +10,7 @@
 """
 import os
 import logging
+import secrets
 
 from dotenv import load_dotenv
 
@@ -53,12 +54,25 @@ class Settings:
     # 显式配置的环境变量优先于数据库中的历史密码。这样改 .env 后无需手动改库。
     ADMIN_PASSWORD_FROM_ENV = "ADMIN_PASSWORD" in os.environ
     ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
-    # 生产环境务必在 .env 中设置 ADMIN_JWT_SECRET 为 >=32 字节的随机串；
-    # 未设置时回退到开发弱密钥并输出告警。
+    # 生产环境务必在 .env 中设置 ADMIN_JWT_SECRET 为 >=32 字节的随机串。
+    #
+    # 未设置时**生成随机密钥**而不是回退到硬编码弱密钥：
+    # 硬编码密钥意味着任何人都能用公开在源码里的字符串签出一个合法的
+    # admin JWT，直接拿到后台完全控制权（而默认 HOST 还是 0.0.0.0）。
+    # 这种 fail-open 与 /gw 的 fail-closed 处置（见 admin/server.py、
+    # admin/gateway_auth）也不一致。
+    #
+    # 这里仍保持「未配置也能启动」的便利性（开发/桌面端场景），但：
+    #   - 密钥随机生成，攻击者无法伪造；
+    #   - 进程重启后旧 token 失效（必须重新登录），不会长期有效；
+    #   - 明确告警，提示生产环境必须持久化配置。
+    # 桌面端由 desktop/app.py 注入随机 ADMIN_JWT_SECRET，不受影响。
     _jwt = os.getenv("ADMIN_JWT_SECRET")
     if not _jwt:
-        _logger.warning("ADMIN_JWT_SECRET 未设置，使用开发弱密钥；生产环境请在 .env 中配置")
-        _jwt = "dev-insecure-jwt-secret-change-me"
+        _jwt = secrets.token_urlsafe(48)
+        _logger.warning(
+            "ADMIN_JWT_SECRET 未设置：已为本次运行生成随机密钥。"
+            "服务重启后所有后台登录态失效；生产环境请务必在 .env 中配置固定密钥。")
     JWT_SECRET = _jwt
     JWT_EXPIRE_HOURS = int(os.getenv("ADMIN_JWT_EXPIRE_HOURS", "24"))
 

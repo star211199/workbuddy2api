@@ -250,10 +250,32 @@ async def receive(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="无效 JSON")
 
     acc_added = acc_updated = 0
+    skipped_invalid = 0
     for a in payload.get("accounts", []):
         uid = a.get("uid")
         if not uid or not a.get("auth_json"):
             continue
+        # 凭证结构校验：与其它所有入库路径保持一致
+        # （accounts.py 的新增/批量/导入本机、login.py 的登录入库都会调它）。
+        #
+        # 为什么必须校验：本端点**不要求后台登录态**（设计上是"线上实例接收端"，
+        # 靠共享 HMAC 密钥鉴权），而签名密钥是"配对凭证"、不是传输层加密 ——
+        # 一旦泄露，未校验的 auth_json 就可以把任意畸形凭据写进号池，
+        # 甚至按 uid 覆盖已有账号、把 disabled 改回 active。
+        # 这里退一步：即使密钥泄露，也只能同步**结构合法**的凭证。
+        try:
+            from admin import wb_login
+            chk = wb_login.validate_credential(a["auth_json"])
+        except Exception as e:  # noqa: BLE001 - 校验本身出错也按非法处理，不阻断整批
+            skipped_invalid += 1
+            _logger.warning("同步接收：账号 uid=%s 凭证校验异常，已跳过（%s）", uid, e)
+            continue
+        if not chk.ok:
+            skipped_invalid += 1
+            _logger.warning("同步接收：跳过结构非法的账号 uid=%s（%s）", uid, chk.reason)
+            continue
+        # uid 以校验结果为准（防止 body 里的 uid 与凭证实际 uid 不符）
+        uid = (chk.meta or {}).get("uid") or uid
         existing = db.query(Account).filter(Account.uid == uid).first()
         if existing:
             existing.auth_json = a["auth_json"]
@@ -324,7 +346,8 @@ async def receive(request: Request, db: Session = Depends(get_db)):
 
     return {
         "ok": True,
-        "accounts": {"added": acc_added, "updated": acc_updated},
+        "accounts": {"added": acc_added, "updated": acc_updated,
+                    "skipped_invalid": skipped_invalid},
         "models": {"added": model_added, "updated": model_updated},
         "client_profile": profile_result,
     }

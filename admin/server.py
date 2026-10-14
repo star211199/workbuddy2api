@@ -225,21 +225,26 @@ def _startup():
 
 
 def _get_stored_hash() -> str:
-    """读取密码哈希；显式配置 ADMIN_PASSWORD 时以 env 为准并同步数据库。
+    """读取密码哈希。
 
-    返回空串表示「未配置登录凭据」——此时 login 一律拒绝，绝不允许空口令登录。
+    优先级：
+      1. 环境变量 `ADMIN_PASSWORD`（显式部署配置）—— 会同步写入数据库；
+      2. 数据库里的 `admin_password`（后台「修改密码」写的那份）；
+      3. 都没有 → 返回空串，login 一律拒绝（绝不允许空口令登录）。
+
+    ⚠️ 原实现第 1 步写成了 `if not settings.ADMIN_PASSWORD: return ""`，
+    也就是**没配环境变量就直接返回空**，压根不去看数据库。后果是：
+    「通过后台修改密码」这条路径**永远不会生效** —— 只要部署时没设
+    ADMIN_PASSWORD，登录就恒定失败（而桌面版恰恰是把随机密码写进
+    config.json / 数据库、不设环境变量的用法）。
     """
-    # 未配置密码：直接拒绝，且不往库里写任何东西
-    if not settings.ADMIN_PASSWORD:
-        return ""
-
     db = None
     try:
         db = SessionLocal()
         row = db.query(SystemSetting).filter(SystemSetting.key == "admin_password").first()
 
-        # env 是部署配置的明确来源，优先级高于数据库中可能遗留的旧密码。
-        if settings.ADMIN_PASSWORD_FROM_ENV:
+        # 1) env 是部署配置的明确来源，优先级高于数据库中可能遗留的旧密码。
+        if settings.ADMIN_PASSWORD and settings.ADMIN_PASSWORD_FROM_ENV:
             if row and row.value and verify_password(settings.ADMIN_PASSWORD, row.value):
                 return row.value
             val = hash_password(settings.ADMIN_PASSWORD)
@@ -250,6 +255,7 @@ def _get_stored_hash() -> str:
             db.commit()
             return val
 
+        # 2) 数据库里的密码（后台改密后的唯一来源）。
         if row and row.value:
             val = row.value
             if not val.startswith("pbkdf2$"):  # 旧明文 → 迁移为哈希
@@ -257,22 +263,21 @@ def _get_stored_hash() -> str:
                 row.value = val
                 db.commit()
             return val
-    finally:
-        if db is not None:
-            db.close()
-    # 无记录：用配置密码并持久化哈希
-    h = hash_password(settings.ADMIN_PASSWORD)
-    db = None
-    try:
-        db = SessionLocal()
+
+        # 3) 库里也没有：若配置了非 env 来源的 ADMIN_PASSWORD 则落库，否则拒绝。
+        if not settings.ADMIN_PASSWORD:
+            return ""
+        h = hash_password(settings.ADMIN_PASSWORD)
         db.add(SystemSetting(key="admin_password", value=h))
         db.commit()
+        return h
     except Exception:
-        pass
+        # 数据库不可用时不要 500，交给调用方按「凭据无效」处理。
+        logger.exception("读取管理员密码哈希失败")
+        return ""
     finally:
         if db is not None:
             db.close()
-    return h
 
 
 @app.post("/api/login")
@@ -296,13 +301,17 @@ def login(
             detail=f"登录尝试过于频繁，请 {wait} 秒后再试",
             headers={"Retry-After": str(wait)},
         )
-    # 未配置凭据时直接拒绝（不能退化成「空口令可登录」）
-    if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
+    # 未配置凭据时直接拒绝（不能退化成「空口令可登录」）。
+    # ⚠️ 判定依据必须是**解析后**的哈希，不能只看 `settings.ADMIN_PASSWORD`：
+    # 桌面版把随机密码写进数据库、不设环境变量，只看 env 会把合法部署
+    # 判成「未配置」并恒定 503（配合后台改密就完全无法登录）。
+    stored_hash = _get_stored_hash()
+    if not settings.ADMIN_USERNAME or not stored_hash:
         raise HTTPException(
             status_code=503,
             detail="后台未配置登录凭据，请在 .env 中设置 ADMIN_USERNAME 与 ADMIN_PASSWORD 后重启",
         )
-    if username != settings.ADMIN_USERNAME or not verify_password(password, _get_stored_hash()):
+    if username != settings.ADMIN_USERNAME or not verify_password(password, stored_hash):
         record_failure(ip)
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     # 仅用户名正确且密码正确才清空失败计数（避免可被探测用户名是否存在）
@@ -321,6 +330,18 @@ def change_password(body: PasswordChangeIn, _: bool = Depends(require_admin)):
         raise HTTPException(status_code=403, detail="当前密码不正确")
     if len(body.new_password) < 6:
         raise HTTPException(status_code=400, detail="新密码长度不能少于 6 位")
+
+    # ⚠️ 若密码来自环境变量（ADMIN_PASSWORD / .env），改库**没有意义**：
+    # `_get_stored_hash()` 在 ADMIN_PASSWORD_FROM_ENV 时会用 env 值覆写数据库，
+    # 于是这里写进去的新密码在下一次读取时就被悄悄改回去了 ——
+    # 接口返回 200、看起来成功，实际密码根本没变（用户会以为改成功了）。
+    # 与其静默失效，不如明确告知正确的改法。
+    if settings.ADMIN_PASSWORD_FROM_ENV:
+        raise HTTPException(
+            status_code=409,
+            detail=("当前密码由环境变量 ADMIN_PASSWORD 指定，无法在后台修改。"
+                    "请修改 .env（或部署环境变量）中的 ADMIN_PASSWORD 后重启服务。"))
+
     db = SessionLocal()
     try:
         row = db.query(SystemSetting).filter(SystemSetting.key == "admin_password").first()
@@ -331,6 +352,22 @@ def change_password(body: PasswordChangeIn, _: bool = Depends(require_admin)):
         db.commit()
     finally:
         db.close()
+    # 改密码后**作废所有已签发的令牌**（含攻击者可能已经偷到的那个）。
+    # 不做这一步的话，「改密码」对已泄露的令牌毫无作用 —— 旧 token 仍能
+    # 用满 24 小时（见 admin.security 的令牌版本机制）。
+    try:
+        from admin.security import bump_token_version
+        bump_token_version()
+    except Exception:
+        logger.exception("递增令牌版本失败；旧令牌可能仍然有效")
+    return {"ok": True, "relogin_required": True}
+
+
+@app.post("/api/admin/logout")
+def logout(_: bool = Depends(require_admin)):
+    """主动登出：作废**所有**已签发令牌（单管理员场景下等价于全端登出）。"""
+    from admin.security import bump_token_version
+    bump_token_version()
     return {"ok": True}
 
 
