@@ -71,6 +71,8 @@ def get_device_token(force: bool = False) -> str | None:
 
     force=True 时忽略缓存（含负缓存），重新向 SDK 索取（用于排查 / 测试）。
     """
+    if os.getenv("WORKBUDDY_ANDROID") == "1":
+        return None
     now = time.time()
     if not force:
         with _lock:

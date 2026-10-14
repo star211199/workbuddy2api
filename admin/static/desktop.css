@@ -23,6 +23,9 @@
 .desktop-mode .page-head{display:none}
 @media(max-width:900px){.desktop-topbar{padding:14px 18px;min-height:74px}.topbar-breadcrumb{display:none}.topbar-actions{gap:8px}.topbar-status{display:none}}
 .version-button:hover{color:var(--brand-ink)}
+.phone-login-footer{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:18px;padding-top:14px;border-top:1px solid var(--border);font-size:11px;color:var(--fg-muted)}
+.phone-login-footer a{color:var(--brand-ink);font-size:12px;text-decoration:none;white-space:nowrap}
+.phone-login-footer a:hover{text-decoration:underline}
 .version-button.has-update{color:var(--brand-ink);font-weight:600}
 .wb-update-dialog{width:min(760px,92vw);max-height:85vh;border:1px solid var(--border);border-radius:16px;background:var(--surface);color:var(--fg);padding:24px;box-shadow:var(--sh-pop)}
 .wb-update-dialog::backdrop{background:#0f172b66}

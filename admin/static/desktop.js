@@ -58,6 +58,9 @@ window.WBDesktop = (() => {
     const actions = element('div', undefined, 'wb-update-actions');
     actions.append(button('重新检查', () => check()), link('打开 Releases', 'https://github.com/xiaofan6ya/workbuddy2api/releases'));
     const latest = releases?.latest;
+    if (window.WBMobile && latest?.asset) {
+      actions.append(link('下载新版 APK', latest.asset.browser_download_url));
+    }
     if (native && latest?.installable) {
       const download = button('下载更新', async () => {
         download.disabled = true;
@@ -70,7 +73,7 @@ window.WBDesktop = (() => {
       }, true);
       actions.append(download);
     } else if (latest && !latest.installable) {
-      dialog.append(element('p', '该版本尚未提供 Windows EXE 或校验文件，可在 Releases 查看。', 'wb-update-meta'));
+      dialog.append(element('p', window.WBMobile ? '该版本尚未提供 Android APK 或校验文件，可在 Releases 查看。' : '该版本尚未提供 Windows EXE 或校验文件，可在 Releases 查看。', 'wb-update-meta'));
     }
     dialog.append(actions);
     const status = element('p', releases?.update?.message || '', 'wb-update-meta');
@@ -163,5 +166,5 @@ window.WBDesktop = (() => {
       .filter(node => node.nodeType === Node.TEXT_NODE).map(node => node.textContent).join('').trim();
   });
   if (window.pywebview?.api) initializeNative();
-  return {openUpdates, retryLocal: initializeNative};
+  return {openUpdates, retryLocal: initializeNative, checkUpdatesAtStartup: () => check(true)};
 })();

@@ -26,11 +26,12 @@ def normalize_response(models, response):
 def get_busy_levels(db, models):
     from admin import backend
     from admin.models import Account
+    from admin.account_binding import scope_accounts
     from sqlalchemy import or_
 
     models = sorted(set(models))
     now = datetime.utcnow()
-    account = db.query(Account).filter(Account.status == "active", *[
+    account = scope_accounts(db.query(Account)).filter(Account.status == "active", *[
         or_(getattr(Account, field).is_(None), getattr(Account, field) <= now)
         for field in ("cool_until", "breaker_until", "degrade_until")
     ]).order_by(Account.id).first()

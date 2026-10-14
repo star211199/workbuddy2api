@@ -1,5 +1,6 @@
 """管理后台 FastAPI 入口：登录、挂载路由、托管前端静态页、启动时建库建表。"""
 import logging
+import os
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
@@ -11,7 +12,7 @@ from pydantic import BaseModel
 from admin.config import settings
 from admin.db import SessionLocal, init_db, wait_database_ready
 from admin.models import SystemSetting
-from admin.routers import (accounts, app_source, client_profile, credits, groups,
+from admin.routers import (accounts, credits, groups,
                            growth, keys, login as login_router, logs, models,
                            proxy, schedules, stats, sync)
 from admin.ratelimit import (clear_failures, get_client_ip, get_trusted_client_ip,
@@ -64,6 +65,8 @@ _ensure_admin_logging()
 # /v1/balance 等协议；与管理后台自带的 /v1/chat/completions、/v1/models（带 Key 配额托管）
 # 路径互不冲突。缺依赖时自动降级为只跑管理后台。
 try:
+    if os.getenv("WORKBUDDY_ANDROID") == "1":
+        raise ImportError("Android uses the account-pool /v1 gateway")
     from converter import app as converter_app, CONFIG as _conv_cfg
     _CONVERTER_EMBEDDED = True
 except Exception:  # pragma: no cover - 降级分支
@@ -104,6 +107,28 @@ async def _security_headers(request: Request, call_next):
 
 app.add_middleware(GatewayAdmissionMiddleware)
 
+if os.getenv("WORKBUDDY_ANDROID") == "1":
+    from admin.request_metrics import TimingMiddleware
+    app.add_middleware(TimingMiddleware)
+
+
+@app.on_event("startup")
+async def _start_upstream_connections():
+    # Own the embedded runtime's pool; recreate it after a service restart.
+    if os.getenv("WORKBUDDY_ANDROID") == "1":
+        from admin import upstream_http
+        await upstream_http.start(app, proxy.HTTP_LIMITS)
+
+
+@app.on_event("shutdown")
+async def _stop_upstream_connections():
+    from admin import upstream_http
+    await upstream_http.stop(app)
+
+if os.getenv("WORKBUDDY_ANDROID") == "1":
+    accounts.router.routes[:] = [route for route in accounts.router.routes
+                                if getattr(route, "path", "") not in
+                                ("/api/accounts/scan-local", "/api/accounts/import-local", "/api/accounts/{acc_id}/inject")]
 app.include_router(accounts.router)
 app.include_router(keys.router)
 app.include_router(models.router)
@@ -115,8 +140,10 @@ app.include_router(groups.router)
 app.include_router(stats.router)
 app.include_router(credits.router)
 app.include_router(growth.router)
-app.include_router(client_profile.router)
-app.include_router(app_source.router)
+if os.getenv("WORKBUDDY_ANDROID") != "1":
+    from admin.routers import app_source, client_profile
+    app.include_router(client_profile.router)
+    app.include_router(app_source.router)
 app.include_router(login_router.router)
 app.include_router(releases.router)
 # 自助上传页（无需后台登录态）：复刻 WorkBuddy 手机号登录页，
@@ -137,6 +164,19 @@ def _startup():
         wb_login.start_gc_thread()
     except Exception:
         logger.exception("手机号登录会话回收线程启动失败（不影响其它功能）")
+
+    # 预热 Turing Shield 设备指纹 token（X-Device-Token）。
+    # 不预热的话，第一个请求会拿到 None（后台线程还没算完），
+    # 被上游判为「非官方客户端」→ 11128，还会触发负缓存，后续 5 分钟全部失败。
+    try:
+        from admin.turing_token import get_device_token
+        tok = get_device_token(force=True)
+        if tok:
+            logger.info("Turing 设备指纹预热成功（X-Device-Token 就绪）")
+        else:
+            logger.warning("Turing 设备指纹预热失败，X-Device-Token 为空")
+    except Exception:
+        logger.warning("Turing 设备指纹预热异常（不影响其它功能）")
 
     # 未配置登录凭据时给出醒目告警：此时后台登录一律 503，不会退化成空口令
     if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
@@ -214,6 +254,11 @@ def _startup():
     if db_ok:
         from admin.scheduler import start_scheduler
         start_scheduler()
+        try:
+            from admin.post_login import resume
+            resume()
+        except Exception:
+            logger.exception("恢复登录后自动任务失败（不影响服务启动）")
 
     # 预热设备风控 token：桌面端不存在时也会填上负缓存，
     # 避免每个请求都在事件循环里同步 fork 一次 node 造成阻塞。

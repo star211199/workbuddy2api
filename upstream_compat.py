@@ -317,26 +317,20 @@ def cleanup_orphan_tool_calls(obj: dict) -> int:
     keep = call_ids & result_ids
     changed = 0
 
-    # 4. assistant：**逐条**剔除没有配对的 tool_call，而不是整条 tool_calls 一起删。
-    #
-    # 原实现是 all-or-nothing（任一 tool_call 缺配对就 pop 整个键）。后果：
-    # 模型一次发起 A、B 两个并行调用、结果**分批回传**（这是 Codex/Claude Code
-    # 的正常行为），当只有 A 回来时，A 明明是**完全合法且已配对**的调用，
-    # 却连同它的结果一起被删除 —— 模型上下文凭空少一轮工具往返，
-    # 可能重复执行已完成的动作（重复写文件 / 重复提交）。
+    # 4. assistant：tool_calls 全有配对才保留，否则删整个键
     for m in msgs:
         if not isinstance(m, dict) or m.get("role") != "assistant":
             continue
         tcs = m.get("tool_calls")
         if not isinstance(tcs, list) or not tcs:
             continue
-        pruned = [tc for tc in tcs
-                  if isinstance(tc, dict) and tc.get("id") in keep]
-        if len(pruned) != len(tcs):
-            if pruned:
-                m["tool_calls"] = pruned
-            else:
-                m.pop("tool_calls", None)
+        keep_all = True
+        for tc in tcs:
+            if not isinstance(tc, dict) or tc.get("id") not in keep:
+                keep_all = False
+                break
+        if not keep_all:
+            m.pop("tool_calls", None)
             changed += 1
 
     # 5. 重算存活 call 集：第 4 步删掉的 tool_calls 里的 id 不能再算配对成功，
@@ -363,6 +357,72 @@ def cleanup_orphan_tool_calls(obj: dict) -> int:
         obj["messages"] = kept
 
     return changed
+
+
+def validate_tool_pairing(messages: list) -> list[str]:
+    """只诊断、不改写：检查 OpenAI messages 里 tool_calls / tool 结果是否配对合法。
+
+    检测项：
+      - assistant.tool_calls[].id 为空
+      - role:tool 的 tool_call_id 为空 / 找不到对应 call
+      - assistant.tool_calls 之后未紧接对应 role:tool（被 user/assistant 插断）
+      - role:tool 出现时当前没有待完成的 tool_calls
+
+    返回问题描述列表（空列表 = 合法）。
+    """
+    problems: list[str] = []
+    if not isinstance(messages, list):
+        return ["messages is not a list"]
+
+    pending: dict[str, int] = {}  # tool_call_id -> assistant msg index
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict):
+            problems.append(f"msg[{i}] is not an object")
+            continue
+        role = m.get("role")
+        if role == "assistant":
+            # 先检查上一轮是否还有未闭合的 tool_calls
+            if pending:
+                missing = list(pending.keys())[:5]
+                problems.append(
+                    f"msg[{i}] assistant starts with unclosed tool_calls {missing}"
+                )
+                pending.clear()
+            tcs = m.get("tool_calls")
+            if isinstance(tcs, list) and tcs:
+                for j, tc in enumerate(tcs):
+                    if not isinstance(tc, dict):
+                        problems.append(f"msg[{i}].tool_calls[{j}] is not an object")
+                        continue
+                    cid = tc.get("id")
+                    if not (isinstance(cid, str) and cid):
+                        problems.append(f"msg[{i}].tool_calls[{j}] has empty id")
+                        continue
+                    if cid in pending:
+                        problems.append(f"msg[{i}].tool_calls[{j}] duplicate id={cid}")
+                    pending[cid] = i
+        elif role == "tool":
+            tid = m.get("tool_call_id")
+            if not (isinstance(tid, str) and tid):
+                problems.append(f"msg[{i}] tool has empty tool_call_id")
+                continue
+            if tid not in pending:
+                problems.append(f"msg[{i}] orphan tool result id={tid}")
+            else:
+                pending.pop(tid, None)
+        else:
+            # user/system 等出现在 tool 配对中间 → 顺序错误
+            if pending:
+                missing = list(pending.keys())[:5]
+                problems.append(
+                    f"msg[{i}] role={role} interrupts tool pairing, missing results for {missing}"
+                )
+                pending.clear()
+
+    if pending:
+        missing = list(pending.keys())[:5]
+        problems.append(f"messages end with unclosed tool_calls {missing}")
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -719,11 +779,25 @@ def _sanitize_content(content):
 
 
 def sanitize_messages(obj: dict) -> int:
-    """脱敏 messages 里的 content / reasoning_content / tool_calls.arguments。
+    """脱敏 messages 里的 content / reasoning_content。
 
-    content 与 tool_calls **独立判定**：content 为 null 的工具调用轮
-    也必须脱敏 tool_calls.arguments（历史盲区）。
     返回改写的消息数。
+
+    ⚠️ 这里**不再**脱敏 `tool_calls[].function.arguments`。
+
+    为什么（实测复现）：`sanitize_text` 会把连续数字等模式改写成带连字符的
+    形态，而 `arguments` 是**会被真正执行的载荷**，不是自然语言散文：
+
+        {"command": "grep -n 11128 app.log"}  ->  {"command": "grep -n 11-128 app.log"}
+        {"path": "docs/11128-notes.md"}       ->  {"path": "docs/11-128-notes.md"}
+        {"url": "https://example.com/11128"}  ->  {"url": "https://example.com/11-128"}
+
+    结果是 JSON 依然合法、不报任何错，但工具去操作一个**不存在**的路径 /
+    查一个永远匹配不到的模式 —— 对调用方表现为"模型没找到东西"，极难排查。
+    对 `arguments` 做"脱敏"在语义上也是错的：它的用途是驱动真实行为，
+    改写它等于篡改用户的指令。
+
+    `content` / `reasoning_content` 是给模型读的文本，仍然脱敏。
     """
     msgs = obj.get("messages")
     if not isinstance(msgs, list):
@@ -744,20 +818,6 @@ def sanitize_messages(obj: dict) -> int:
             if new != rc:
                 m["reasoning_content"] = new
                 touched = True
-        tcs = m.get("tool_calls")
-        if isinstance(tcs, list):
-            # ⚠️ **不要**对 `function.arguments` 做 sanitize_text。
-            #
-            # arguments 是**会被真正执行的载荷**（命令行、文件路径、查询串），
-            # 不是自然语言模板。对它做关键词改写会把语义改掉，而且 JSON 依旧合法、
-            # 不报错、无人察觉：
-            #   {"command": "grep -n 11128 app.log"}      -> "grep -n 11-128 app.log"
-            #   {"cmd": "x-anthropic-billing-header: a;cc_entrypoint=cli; run"} -> "; run"
-            #   {"path": "docs/11128-notes.md"}           -> "docs/11-128-notes.md"
-            # 工具会去查一个不存在的东西，返回「无匹配」时看起来像正常结果 ——
-            # 属静默数据破坏。上游审核针对的是 system/harness 模板文本，
-            # 这些参数不在其列。
-            pass
         if touched:
             n += 1
     return n

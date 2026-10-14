@@ -21,6 +21,7 @@ opentelemetry-api==1.45.1
 packaging==26.3
 pefile==2023.2.7
 pillow==12.3.0
+pystray==0.19.5
 proxy-tools==0.1.0
 pycparser==3.11
 pydantic==2.14.1

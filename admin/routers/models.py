@@ -11,11 +11,12 @@ import json
 import time
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from admin import backend
+from admin.account_binding import scope_accounts
 from admin.config import settings
 from admin.db import get_db
 from admin.models import Account, ModelConfig
@@ -105,7 +106,7 @@ def _do_sync_models(db: Session) -> dict:
 
     需要一个有效账号来调用后端 API；优先选 active 且余额 > 0 的账号。
     """
-    acc = db.query(Account).filter(
+    acc = scope_accounts(db.query(Account)).filter(
         Account.status == "active", Account.balance_remain > 0
     ).first()
     if not acc:
@@ -239,6 +240,7 @@ _SPEED_TEST_PROMPT = [{"role": "user", "content": "用一句话介绍一下你�
 @router.post("/speed-test")
 async def speed_test(
     body: dict,
+    request: Request,
     _: bool = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
@@ -257,7 +259,7 @@ async def speed_test(
     messages = body.get("messages") or _SPEED_TEST_PROMPT
 
     # 选可用账号（与代理一致：active 且余额>0，剩余最多优先）
-    acc = db.query(Account).filter(
+    acc = scope_accounts(db.query(Account)).filter(
         Account.status == "active", Account.balance_remain > 0
     ).order_by(Account.balance_remain.desc()).first()
     if not acc:
@@ -271,18 +273,18 @@ async def speed_test(
                     f"但没有任何「启用且余额大于 0」的账号"
                     f"（本接口不判断在途与冷却状态）"))
 
-    # ⚠️ 这个端点是 `async def`，所以下面这些**同步阻塞**调用都会卡住事件循环：
+    from admin import upstream_http
+    # ⚠️ 这个端点是 `async def`，下面这些**同步阻塞**调用都必须丢到线程池：
     #   * AccountSession(...)  —— 落盘凭据临时文件（文件 I/O）
     #   * sess.get_headers()   —— token 过期时会走 `httpx.Client(timeout=15)` 刷新
     #   * db.commit()          —— 同步 SQLAlchemy
     # 在事件循环里阻塞的后果不是「慢一点」，而是**整个进程的所有请求一起停摆**
     # （包括正在跑的 /v1/* 流式响应）。proxy.py 里有一大段注释专门解释
     # `/v1/models` 为什么必须是 `def`，就是这个原因。
-    # 这里全部丢到线程池执行，保持与 proxy 一致的纪律。
     sess = await asyncio.to_thread(backend.AccountSession, acc.auth_json)
     try:
         headers = await asyncio.to_thread(sess.get_headers)
-    except Exception:
+    except BaseException:
         await asyncio.to_thread(sess.close)
         raise
     url = f"{settings.BACKEND}/v2/chat/completions"
@@ -316,7 +318,7 @@ async def speed_test(
         await asyncio.to_thread(sess.close)
 
     try:
-        async with httpx.AsyncClient(timeout=120, limits=backend.HTTP_LIMITS) as client:
+        async with upstream_http.client(request, 120, backend.HTTP_LIMITS) as client:
             async with client.stream("POST", url, headers=headers, json=payload) as r:
                 if r.status_code >= 400:
                     detail = await r.aread()

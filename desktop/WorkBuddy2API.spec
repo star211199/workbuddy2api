@@ -19,10 +19,14 @@ hidden += ['uvicorn.logging', 'uvicorn.loops.asyncio', 'uvicorn.protocols.http.h
            'uvicorn.lifespan.on', 'sqlalchemy.dialects.sqlite', 'sqlalchemy.dialects.mysql.pymysql',
            'converter', 'anthropic_adapter', 'responses_adapter', 'responses_projection',
            'desensitize', 'upstream_compat', 'wb_install', 'wb_asar', 'wb_envcheck',
-           'webview.platforms.edgechromium', 'webview.platforms.winforms', 'clr', 'pythonnet']
+           'webview.platforms.edgechromium', 'webview.platforms.winforms', 'clr', 'pythonnet',
+           # Tray shell: pystray loads its backend lazily, so collect them explicitly.
+           'pystray._win32', 'pystray._util', 'PIL.Image', 'PIL.ImageDraw', 'PIL._tkinter_finder']
 a = Analysis([str(root / 'desktop_entry.py')], pathex=[str(root)], datas=datas, hiddenimports=hidden,
              excludes=['tkinter', 'PyQt5', 'PyQt6', 'PySide2', 'PySide6', 'cefpython3',
-                       'cairosvg', 'resvg_py', 'PIL', 'numpy', 'scipy', 'matplotlib', 'pytest',
+                       # 注意：**不能**排除 PIL —— 系统托盘（desktop/tray.py）依赖
+                       # pystray + PIL.ImageDraw 绘制托盘图标。
+                       'cairosvg', 'resvg_py', 'numpy', 'scipy', 'matplotlib', 'pytest',
                        'IPython', 'watchfiles', 'websockets', 'httptools',
                        # 排除 setuptools / pkg_resources：
                        # proxy_tools（pywebview 的依赖）会把它带进来，触发 PyInstaller 的

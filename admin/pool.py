@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import random
 import threading
 import time
@@ -99,7 +100,12 @@ async def rotate_backoff_async(n: int) -> bool:
     由调用方的流式生成器自然终止（等价于 master 的 sleepCtx 返回 false）。"""
     d = backoff_after_ms(n) / 1000.0
     if d > 0:
-        await asyncio.sleep(d)
+        if os.getenv('WORKBUDDY_ANDROID') == '1':
+            from admin import request_metrics
+            with request_metrics.measure('retry_backoff'):
+                await asyncio.sleep(d)
+        else:
+            await asyncio.sleep(d)
     return True
 
 

@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends
@@ -48,7 +48,7 @@ def _ms(dt: Optional[datetime]) -> Optional[int]:
     """naive-UTC datetime → 毫秒时间戳。"""
     if not dt:
         return None
-    return int(dt.replace(tzinfo=None).timestamp() * 1000)
+    return int((dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp() * 1000)
 
 
 def _package_row(r: dict) -> dict:
@@ -194,7 +194,9 @@ def credit_expiry_stats(
     cuts = [1, 3, 7, 14, 30]
     buckets = {c: {"amount": 0.0, "packages": 0} for c in cuts}
     flat: list[dict] = []
-    for acc_row, acc in zip(rows, accounts):
+    rows_by_id = {r["account_id"]: r for r in rows}
+    for acc in accounts:
+        acc_row = rows_by_id[acc.id]
         snap = _snapshot_of(acc)
         for p in (snap.get("resources") or []):
             remaining = float(p.get("remaining") or 0)

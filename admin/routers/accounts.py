@@ -9,14 +9,16 @@ import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from admin import backend, jobrunner, wb_login
+from admin.account_binding import binding_owners, scope_accounts
+from admin.credential_codec import CredentialDecodeError, normalize_credential
 from admin.config import settings
 from admin.db import SessionLocal, get_db
-from admin.models import Account, AccountModelCooldown, ModelConfig, UsageLog
+from admin.models import Account, AccountModelCooldown, ApiKey, ModelConfig, UsageLog
 from admin.security import require_admin
 
 #: 模块日志器。此前 `_post_login_automation` 的 except 分支调用了 `_logger`
@@ -32,6 +34,14 @@ router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 class AccountIn(BaseModel):
     name: Optional[str] = None  # 留空则自动取真实昵称 / uid
     auth_json: str
+
+    @validator('name', pre=True)
+    def encrypted_name_is_not_a_label(cls, value):
+        # Older browser pages submit account.nickname directly. The decrypted
+        # credential/upstream profile supplies the real name after decoding.
+        if isinstance(value, dict) and value.get('$wbEncrypted') == 1 and isinstance(value.get('envelope'), str):
+            return None
+        return value
 
 
 class AccountBatchIn(BaseModel):
@@ -86,6 +96,15 @@ def _reject_non_credential(auth_json: str) -> dict:
             "step": "validate",
         })
     return check.meta
+
+
+def _decode_or_400(auth_json: str) -> str:
+    try:
+        return normalize_credential(auth_json)
+    except CredentialDecodeError as exc:
+        raise HTTPException(status_code=400, detail={
+            'message': str(exc), 'step': 'decrypt',
+        }) from None
 
 
 def _verify_credential_live_or_400(auth_json: str):
@@ -416,8 +435,11 @@ def _credit_fields(a: Account) -> dict:
 @router.get("")
 def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
     rows = db.query(Account).order_by(Account.id.desc()).all()
+    owners = binding_owners(db)
     now = datetime.utcnow()
     limits = _active_model_limits(db, now)
+    from admin.post_login import states
+    automation = states(db, [a.id for a in rows])
     items = [
         {
             "id": a.id,
@@ -426,12 +448,15 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
             "enterprise_id": a.enterprise_id,
             "domain": a.domain,
             "status": a.status,
+            "bound_key_id": owners[a.id].id if owners.get(a.id) else None,
+            "bound_key_name": owners[a.id].name if owners.get(a.id) else "",
             "balance_total": a.balance_total,
             "balance_remain": a.balance_remain,
             "last_sync_at": a.last_sync_at.isoformat() if a.last_sync_at else None,
             "last_used_at": a.last_used_at.isoformat() if a.last_used_at else None,
             "created_at": a.created_at.isoformat() if a.created_at else None,
             "model_limits": limits.get(a.id, []),
+            "post_login_automation": automation.get(a.id),
             **_gateway_fields(a, now),
             **_credit_fields(a),
         }
@@ -521,6 +546,7 @@ def model_limits(_: bool = Depends(require_admin), db: Session = Depends(get_db)
     now = datetime.utcnow()
     rows = db.query(Account).all()
     limits = _active_model_limits(db, now)
+    public_ids = {a.id for a in scope_accounts(db.query(Account)).all()}
     start = (now + timedelta(hours=8)).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=8)
     usage = {(account_id, model): {"requests_today": count, "tokens_today": int(tokens or 0)}
              for account_id, model, count, tokens in db.query(
@@ -541,7 +567,7 @@ def model_limits(_: bool = Depends(require_admin), db: Session = Depends(get_db)
         config = configs.get(model)
         free = config is not None and config.credit_multiplier == 0
         blocked = {e["account_id"] for e in items if e["model"] == model}
-        available = [a for a in rows if a.status == "active" and a.id not in blocked
+        available = [a for a in rows if a.id in public_ids and a.status == "active" and a.id not in blocked
                      and _gateway_fields(a, now)["gateway_state"] == "ready"
                      and (free or (a.balance_remain or 0) > 0)
                      and not POOL.inflight.full(a.uid or "", settings.MAX_IN_FLIGHT)]
@@ -570,8 +596,38 @@ def clear_model_limit(acc_id: int, body: ClearModelLimit,
     return {"ok": True, "cleared": count}
 
 
+@router.post("/{acc_id}/cooldown/clear")
+def clear_account_cooldown(acc_id: int,
+                           _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """清除账号级冷却（cool_until / 熔断 / 降权），让该号立刻重新参与调度。
+
+    只清**本地调度状态**，不动官方额度、不动模型级冷却（那是另一条台账）。
+    连败/熔断计数一并清零 —— 否则残留计数会在下次失败时立刻再叠一层冷却。
+    登录态失效计数（session_dead_fails）保留：那是登录健康问题，不该被
+    「解除冷却」悄悄洗掉。
+    """
+    acc = db.query(Account).filter(Account.id == acc_id).first()
+    if not acc:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    was_cooling = bool(
+        (acc.cool_until and acc.cool_until > datetime.utcnow())
+        or (acc.breaker_until and acc.breaker_until > datetime.utcnow())
+        or (acc.degrade_until and acc.degrade_until > datetime.utcnow())
+    )
+    acc.cool_until = None
+    acc.cool_kind = ""
+    acc.breaker_until = None
+    acc.degrade_until = None
+    acc.err_count = 0
+    acc.breaker_fails = 0
+    acc.consecutive_fails = 0
+    db.commit()
+    return {"ok": True, "cleared": was_cooling}
+
+
 @router.post("")
 def add_account(body: AccountIn, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    body.auth_json = _decode_or_400(body.auth_json)
     # 第一道：只收「auth 之后的授权 JSON」，非凭证一律 400
     _reject_non_credential(body.auth_json)
     # 第二道：**真调上游**确认凭证可用、非伪造，并取回真实账号信息 + 余额
@@ -619,6 +675,11 @@ def batch_add(body: AccountBatchIn, _: bool = Depends(require_admin), db: Sessio
     seen = _existing_uid_index(db)
     for it in body.items:
         if not it.auth_json or not it.auth_json.strip():
+            continue
+        try:
+            it.auth_json = normalize_credential(it.auth_json)
+        except CredentialDecodeError as exc:
+            errors.append(f"跳过一条：{exc}")
             continue
         # 第一道：非凭证拒收（与单条上传、与手机号登录共用同一校验器）
         chk = wb_login.validate_credential(it.auth_json)
@@ -701,15 +762,19 @@ def dedupe_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_
     为什么保留最早的那条：使用记录（last_used_at）与既有关联数据都挂在
     老记录上，重复导入产生的新记录这些字段都是空的，删掉损失最小。
     """
-    rows = db.query(Account).order_by(Account.id.asc()).all()
+    rows = db.query(Account).order_by(Account.id.asc()).with_for_update().all()
     groups: dict[str, list[Account]] = {}
     for a in rows:
         if a.uid:
             groups.setdefault(a.uid, []).append(a)
 
     removed: list[dict] = []
+    bound_ids = {k.account_id for k in db.query(ApiKey).filter(ApiKey.account_id.is_not(None)).with_for_update().all()}
     for uid, grp in groups.items():
-        for a in grp[1:]:
+        keep = next((a for a in grp if a.id in bound_ids), grp[0])
+        for a in grp:
+            if a.id == keep.id or a.id in bound_ids:
+                continue
             removed.append({"id": a.id, "name": a.name, "uid": uid})
             db.delete(a)
     db.commit()
@@ -730,7 +795,8 @@ def scan_local(_: bool = Depends(require_admin)):
     active_file = os.path.join(d, "workbuddy-desktop.info")
     if os.path.exists(active_file):
         try:
-            active_uid = (json.load(open(active_file, encoding="utf-8")).get("account") or {}).get("uid")
+            with open(active_file, encoding="utf-8-sig") as source:
+                active_uid = (json.load(source).get("account") or {}).get("uid")
         except Exception:
             pass
     items = []
@@ -740,9 +806,15 @@ def scan_local(_: bool = Depends(require_admin)):
         if base.endswith(".bak") or ".bak-" in base:
             continue
         try:
-            data = json.load(open(f, encoding="utf-8"))
+            with open(f, encoding="utf-8-sig") as source:
+                data = json.load(source)
         except Exception:
             continue
+        credential_error = ''
+        try:
+            data = json.loads(normalize_credential(json.dumps(data)))
+        except CredentialDecodeError as exc:
+            credential_error = str(exc)
         meta = backend.parse_auth_meta(json.dumps(data))
         uid = meta.get("uid") or ""
         # 同 uid 只保留一份（优先保留无时间戳后缀的"实时登录"文件）
@@ -769,6 +841,7 @@ def scan_local(_: bool = Depends(require_admin)):
             "is_active": (uid == active_uid),
             "expires_at": expires_str,
             "expires_ts": expires_at,
+            "credential_error": credential_error,
         })
     return {"dir": d, "exists": True, "active_uid": active_uid, "items": items}
 
@@ -795,9 +868,15 @@ def import_local(body: ImportLocalIn, _: bool = Depends(require_admin), db: Sess
             errors.append(f"文件不存在: {name}")
             continue
         try:
-            auth = open(path, encoding="utf-8").read()
+            with open(path, encoding="utf-8-sig") as source:
+                auth = source.read()
         except Exception:
             errors.append(f"{name}: 读取失败")
+            continue
+        try:
+            auth = normalize_credential(auth)
+        except CredentialDecodeError as exc:
+            errors.append(f"{name}: {exc}")
             continue
         # 目录里的 *.info 未必都是凭证（可能有半截文件 / 别的 JSON），
         # 与上传入口用同一个校验器把关，避免把垃圾读进号池。
@@ -1368,9 +1447,11 @@ def patch_account(
 
 @router.delete("/{acc_id}")
 def delete_account(acc_id: int, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    acc = db.query(Account).filter(Account.id == acc_id).first()
+    acc = db.query(Account).filter(Account.id == acc_id).with_for_update().first()
     if not acc:
         raise HTTPException(status_code=404, detail="账号不存在")
+    if db.query(ApiKey).filter(ApiKey.account_id == acc_id).with_for_update().first():
+        raise HTTPException(409, "该账号已绑定 API Key，请先解除绑定再删除")
     db.query(AccountModelCooldown).filter(AccountModelCooldown.account_id == acc_id).delete(synchronize_session=False)
     db.delete(acc)
     db.commit()

@@ -567,23 +567,7 @@ def _mask_name(name: str) -> str:
 #: 登录后自动做的事（都做成可开关，便于按需关掉）
 POST_LOGIN_AUTOMATION = True
 
-#: 同时允许在跑的「登录后收尾」线程数。
-#:
-#: 为什么必须限流：一次收尾要跑约 5 分钟（15 个任务 + 猫猫旅行 + 签到），
-#: 期间一直在打上游。如果不限制，注册洪峰（比如 50 人同时注册）就会拉起
-#: 50 个这样的线程 —— 那正是我们刚给登录链路加闸门要避免的情况，
-#: 只不过换成了后台线程，照样能把上游打爆、把本机 CPU/内存吃满。
-#:
-#: 取 2：收尾是「锦上添花」，慢一点没关系；超出的**直接跳过**
-#: （账号已入库、功能正常，只是这次不自动做任务，等每天的定时任务兜底）。
-MAX_POST_LOGIN_WORKERS = 2
-
-#: 当前在跑的收尾线程数
-_post_login_active = 0
-_post_login_lock = threading.Lock()
-
-
-def _run_post_login_automation(account_id: int, name: str) -> None:
+def _run_post_login_automation(account_id: int, name: str) -> dict:
     """后台线程：对一个刚入库的账号做成长任务 + 猫猫旅行 + 签到。
 
     每一步都独立 try：任一环节失败不影响其它环节，也绝不影响登录结果。
@@ -593,11 +577,12 @@ def _run_post_login_automation(account_id: int, name: str) -> None:
     from admin import backend
 
     log = logging.getLogger("admin.wb_login_router")
+    result = {"errors": [], "pet_credits": 0, "growth_credits": 0, "checkin_credits": 0}
     db = SessionLocal()
     try:
         acc = db.query(Account).filter(Account.id == account_id).first()
         if not acc:
-            return
+            return {"errors": ["账号不存在"]}
         log.info("wb_login: 登录后收尾开始 id=%s name=%s", account_id, name)
         _t0 = _t.time()
 
@@ -607,9 +592,14 @@ def _run_post_login_automation(account_id: int, name: str) -> None:
                 res = sess.run_cat_travel()
                 acc.auth_json = sess.updated_json()
                 db.commit()
+            result["pet_credits"] = res.get("credits") or 0
+            if not res.get("ok") or res.get("outcome") == "gate_blocked":
+                result["errors"].append("宠物领养或旅行未完成")
             log.info("wb_login: 收尾-猫猫旅行 id=%s outcome=%s credits=%s",
                      account_id, res.get("outcome"), res.get("credits"))
         except Exception as e:
+            db.rollback()
+            result["errors"].append("宠物任务失败")
             log.warning("wb_login: 收尾-猫猫旅行失败 id=%s: %s", account_id, e)
 
         # ---- 2) 每日签到 ----
@@ -618,11 +608,14 @@ def _run_post_login_automation(account_id: int, name: str) -> None:
                 st = sess.get_checkin_status()
                 if not st.get("today_checked_in"):
                     r = sess.claim_daily_checkin()
+                    result["checkin_credits"] = r.get("credit") or 0
                     log.info("wb_login: 收尾-签到 id=%s ok=%s credit=%s",
                              account_id, r.get("ok"), r.get("credit"))
                 acc.auth_json = sess.updated_json()
                 db.commit()
         except Exception as e:
+            db.rollback()
+            result["errors"].append("签到失败")
             log.warning("wb_login: 收尾-签到失败 id=%s: %s", account_id, e)
 
         # ---- 3) 成长任务（含自动领奖）----
@@ -634,10 +627,15 @@ def _run_post_login_automation(account_id: int, name: str) -> None:
             rows = r.get("results") or []
             if rows:
                 first = rows[0]
+                result["growth_credits"] = first.get("credit") or 0
+                if not first.get("ok") or first.get("budget_exceeded") or first.get("claim_failed"):
+                    result["errors"].append("部分成长任务未完成或奖励未领取")
                 log.info("wb_login: 收尾-成长任务 id=%s 任务数=%s 领取积分=%s 能量=%s",
                          account_id, len(first.get("tasks") or []),
                          first.get("credit"), first.get("energy"))
         except Exception as e:
+            db.rollback()
+            result["errors"].append("成长任务失败")
             log.warning("wb_login: 收尾-成长任务失败 id=%s: %s", account_id, e)
 
         # ---- 4) 再刷一次余额，把上面领到的积分反映出来 ----
@@ -653,44 +651,27 @@ def _run_post_login_automation(account_id: int, name: str) -> None:
                      account_id, _t.time() - _t0,
                      acc.balance_remain, acc.balance_total)
         except Exception as e:
+            db.rollback()
+            result["errors"].append("余额刷新失败")
             log.warning("wb_login: 收尾-最终刷新余额失败 id=%s: %s", account_id, e)
     except Exception:
+        db.rollback()
+        result["errors"].append("自动任务异常")
         log.exception("wb_login: 登录后收尾异常 id=%s（不影响登录结果）", account_id)
     finally:
         db.close()
-
-
-def _post_login_worker(account_id: int, name: str) -> None:
-    """收尾线程的包装：结束后归还并发名额。"""
-    global _post_login_active
-    try:
-        _run_post_login_automation(account_id, name)
-    finally:
-        with _post_login_lock:
-            _post_login_active = max(0, _post_login_active - 1)
+    return result
 
 
 def _schedule_post_login_automation(account_id: int, name: str) -> None:
-    """把收尾工作丢进后台线程（不阻塞登录响应，且并发受限）。
-
-    拿不到名额就**跳过**（不是排队）：账号已经入库、能正常用，
-    只是这次不自动做任务 —— 等每天的定时任务兜底即可。
-    排队反而会积压出一堆待跑线程，得不偿失。
-    """
-    global _post_login_active
+    """Persist and queue onboarding without blocking the login response."""
     if not POST_LOGIN_AUTOMATION:
         return
-    with _post_login_lock:
-        if _post_login_active >= MAX_POST_LOGIN_WORKERS:
-            logging.getLogger("admin.wb_login_router").info(
-                "wb_login: 收尾线程已满(%d)，跳过 id=%s（账号已入库，"
-                "将由每日定时任务兜底）", _post_login_active, account_id)
-            return
-        _post_login_active += 1
-    threading.Thread(target=_post_login_worker,
-                     args=(account_id, name),
-                     name="wb-post-login-%s" % account_id,
-                     daemon=True).start()
+    try:
+        from admin.post_login import enqueue
+        enqueue(account_id, name)
+    except Exception:
+        _logger.exception("登录后任务提交失败 account_id=%s（不影响入库）", account_id)
 
 
 # ---------------------------------------------------------------------------

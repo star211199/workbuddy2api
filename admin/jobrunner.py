@@ -94,6 +94,13 @@ class Job:
             # 预估总数：账号级总数 × 每个账号约 15 个任务，仅用于显示「已做 N 个」
             self.task_total = max(self.task_total, self.task_done)
 
+    def task_start(self, account: str, item: dict) -> None:
+        """Expose the current stage before a slow upstream call starts."""
+        with self._lock:
+            self.current = account
+            self.task_current = str(item.get("title") or item.get("task_code") or "")
+            self.beat_at = datetime.utcnow()
+
     def set_phase(self, phase: str) -> None:
         self.phase = phase
 

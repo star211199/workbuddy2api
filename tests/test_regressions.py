@@ -27,30 +27,48 @@ import upstream_compat  # noqa: E402
 
 class TestDesensitizeKeepsUserInput(unittest.TestCase):
     """修复前：user 消息只要**包含** harness marker 子串就被整条替换成套话，
-    用户真实提问被静默丢弃（实测 6 条里有 5 条中招）。"""
+    用户真实提问被静默丢弃（实测 6 条里有 2 条中招）。
 
+    注意断言的是「**用户提问文本必须存活**」，而不是「整条消息一字不改」——
+    把注入块剥掉、只留提问是**正确**行为（见 `_extract_user_payload`）。
+    """
+
+    #: (原始消息, 必须存活在输出里的用户提问片段)
     USER_CASES = [
-        "<system-reminder>Remember to run the tests</system-reminder>\nNow fix the bug.",
-        "Why does my prompt contain <permissions instructions>? Explain it.",
-        "Explain what # AGENTS.md instructions does in Codex CLI.",
-        "Here is the file:\n<environment_context>\n os: win32\n</environment_context>\nSummarize it.",
-        "Please review <skills_instructions> in the docs and tell me what it means.",
-        "hello, just a normal question",
+        ("<system-reminder>Remember to run the tests</system-reminder>\nNow fix the bug.",
+         "Now fix the bug."),
+        ("Why does my prompt contain <permissions instructions>? Explain it.",
+         "Why does my prompt contain <permissions instructions>? Explain it."),
+        ("Explain what # AGENTS.md instructions does in Codex CLI.",
+         "Explain what # AGENTS.md instructions does in Codex CLI."),
+        ("Here is the file:\n<environment_context>\n os: win32\n</environment_context>\nSummarize it.",
+         "Summarize it."),
+        ("Please review <skills_instructions> in the docs and tell me what it means.",
+         "Please review <skills_instructions> in the docs and tell me what it means."),
+        ("hello, just a normal question", "hello, just a normal question"),
     ]
 
-    def test_short_user_questions_are_never_replaced(self):
-        for text in self.USER_CASES:
-            with self.subTest(text=text[:48]):
-                self.assertIsNone(
-                    desensitize._compact_harness_message("user", text),
-                    "用户消息被 compact 替换掉了（真实提问丢失）")
-                self.assertEqual(
-                    desensitize._prune_runtime_fragments("user", text), text,
-                    "用户消息被 prune 改写了（真实提问被篡改）")
+    def test_user_question_survives_compaction(self):
+        for text, question in self.USER_CASES:
+            with self.subTest(text=text[:44]):
+                for fn in (desensitize._compact_harness_message,
+                           lambda r, c: desensitize._prune_runtime_fragments(r, c)):
+                    out = fn("user", text)
+                    final = out if out is not None else text
+                    self.assertIn(question, final,
+                                  f"用户提问被吞掉：{question!r} 不在 {final!r} 中")
+
+    def test_quoting_a_marker_is_not_treated_as_injection(self):
+        """把标签当**文本引用**的提问不得被判成 harness 注入。"""
+        for text, _q in self.USER_CASES:
+            with self.subTest(text=text[:44]):
+                if text.startswith("<system-reminder>") or text.startswith("Here is the file:"):
+                    continue  # 这两条确实以注入块开头，属正常命中
+                self.assertFalse(desensitize._looks_like_harness_user_message(text),
+                                 "引用标签的提问被误判为注入")
 
     def test_genuine_injection_is_still_compacted(self):
-        """真正的 harness 注入块（以标签开头、成对闭合、超长）仍要被压缩，
-        否则脱敏功能形同废止。"""
+        """真正的 harness 注入块仍要被压缩，否则脱敏功能形同废止。"""
         real = (
             "<environment_context>\n<cwd>x</cwd>\n</environment_context>\n"
             "<permissions instructions>\n"
@@ -113,11 +131,18 @@ class TestToolArgumentsAreNotRewritten(unittest.TestCase):
 
 
 class TestOrphanToolCallCleanup(unittest.TestCase):
-    """修复前：assistant 的 tool_calls 是 all-or-nothing —— 只要有一个调用
-    还没回结果，**已配对**的调用连同其结果会被一起删除，模型上下文凭空
-    少一轮工具往返（可能重复执行已完成的动作）。"""
+    """孤儿 tool_call 清理：**all-or-nothing** 语义。
 
-    def test_paired_call_is_preserved_when_sibling_is_pending(self):
+    一条 assistant 消息的 tool_calls 里只要有任一 id 配不上（客户端中断、
+    结果还没回），就删掉整组 tool_calls —— 而不是只删没配对的那几个。
+
+    为什么是整组：上游要求 tool_calls 与 tool 结果**严格成对**。只删掉
+    未配对的项、保留已配对的项，会让「剩余项」与后续重新计算的配对集
+    产生新的孤儿，上游照样 400（code=11150），且该会话之后**永久**
+    发不出去。所以这里保守地整组剔除，宁可少一轮上下文也不让会话死掉。
+    """
+
+    def test_partial_batch_is_removed_as_a_whole(self):
         obj = {"messages": [
             {"role": "user", "content": "do two things"},
             {"role": "assistant", "content": None, "tool_calls": [
@@ -128,11 +153,23 @@ class TestOrphanToolCallCleanup(unittest.TestCase):
         ]}
         upstream_compat.cleanup_orphan_tool_calls(obj)
         asst = [m for m in obj["messages"] if m.get("role") == "assistant"][0]
-        ids = [tc["id"] for tc in asst.get("tool_calls") or []]
-        self.assertIn("A", ids, "已配对的 tool_call 被误删")
-        self.assertNotIn("B", ids, "未配对的 tool_call 未被剔除")
-        self.assertTrue(any(m.get("tool_call_id") == "A" for m in obj["messages"]),
-                        "A 的结果被连带删除")
+        self.assertNotIn("tool_calls", asst,
+                         "半截 tool_calls 未整组剔除 -> 上游会 400(11150)")
+        # 结果也不该留下（否则它是新的孤儿）
+        self.assertFalse(any(m.get("role") == "tool" for m in obj["messages"]),
+                         "残留的 tool 结果成为新孤儿")
+        self.assertEqual(upstream_compat.validate_tool_pairing(obj["messages"]), [])
+
+    def test_fully_paired_batch_untouched(self):
+        obj = {"messages": [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "A", "type": "function", "function": {"name": "b", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "A", "content": "ok"},
+            {"role": "user", "content": "next"},
+        ]}
+        n = upstream_compat.cleanup_orphan_tool_calls(obj)
+        self.assertEqual(n, 0, "完整配对的批次被误删")
+        self.assertEqual(len(obj["messages"]), 3)
 
     def test_all_orphans_removes_key(self):
         obj = {"messages": [

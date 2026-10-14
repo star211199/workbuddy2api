@@ -1,6 +1,7 @@
 """Per-key sliding window and renewable Redis concurrency leases."""
 from collections import deque
 import asyncio
+import anyio
 import logging
 import math
 import uuid
@@ -79,8 +80,13 @@ def _limits():
     return max(0, int(getattr(settings, "GATEWAY_RATE_PER_MINUTE", 0))), max(0, int(getattr(settings, "GATEWAY_MAX_CONCURRENT", 0)))
 
 
-def allow(key):
-    rate, concurrent = _limits()
+def allow(key, rate=None, concurrent=None):
+    """申请准入。concurrent 支持 per-key 覆盖：None=全局默认，0=不限，N=上限 N。"""
+    g_rate, g_conc = _limits()
+    if rate is None:
+        rate = g_rate
+    if concurrent is None:
+        concurrent = g_conc
     if not key or (not rate and not concurrent):
         return Admission(None)
     client = _redis_client()
@@ -146,12 +152,42 @@ def _valid_key_id(token):
         return str(row.id) if row and row.status == "active" else None
 
 
+def _key_admission_params(token):
+    """解析 token → (key_id, rate, concurrent)。
+
+    concurrent 语义：
+      None = 跟随全局 ADMIN_GATEWAY_MAX_CONCURRENT
+      0    = 该 key 不限并发
+      N    = 最多 N 路在途
+    """
+    rate, g_conc = _limits()
+    if not token:
+        return None, rate, g_conc
+    from admin.db import SessionLocal
+    from admin.security import get_key_row
+    with SessionLocal() as db:
+        row = get_key_row(db, token)
+        if not row or row.status != "active":
+            return None, rate, g_conc
+        mc = getattr(row, "max_concurrent", None)
+        if mc is None:
+            conc = g_conc
+        else:
+            conc = max(0, int(mc))
+        return str(row.id), rate, conc
+
+
 async def _finish_thread(fn, *args):
     task = asyncio.create_task(asyncio.to_thread(fn, *args))
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        await task
+        with anyio.CancelScope(shield=True):
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
         raise
 
 
@@ -161,7 +197,7 @@ class GatewayAdmissionMiddleware:
 
     async def __call__(self, scope, receive, send):
         from starlette.responses import JSONResponse
-        if scope['type'] != 'http' or not scope.get('path', '').startswith('/v1/') or not any(_limits()):
+        if scope['type'] != 'http' or not scope.get('path', '').startswith('/v1/'):
             return await self.app(scope, receive, send)
         headers = dict(scope.get('headers', []))
         token = headers.get(b'x-api-key', b'').decode('latin1')
@@ -169,16 +205,24 @@ class GatewayAdmissionMiddleware:
             auth = headers.get(b'authorization', b'').decode('latin1')
             token = auth[7:].strip() if auth.startswith('Bearer ') else ''
         # Only authenticated IDs enter the bounded state, never raw client tokens.
-        key = await _finish_thread(_valid_key_id, token) if token else None
-        if key is None:
+        # per-key 并发：解析后的 concurrent 可能与全局不同，须一并传给 allow。
+        key, rate, concurrent = await _finish_thread(_key_admission_params, token) if token \
+            else (None, *_limits())
+        if key is None or not (rate or concurrent):
             return await self.app(scope, receive, send)
-        pending = asyncio.create_task(asyncio.to_thread(allow, key))
+        pending = asyncio.create_task(asyncio.to_thread(allow, key, rate, concurrent))
         try:
             result = await asyncio.shield(pending)
         except asyncio.CancelledError:
-            result = await pending
-            if not isinstance(result, tuple):
-                await _finish_thread(release, result)
+            with anyio.CancelScope(shield=True):
+                while not pending.done():
+                    try:
+                        await asyncio.shield(pending)
+                    except asyncio.CancelledError:
+                        continue
+                result = pending.result()
+                if not isinstance(result, tuple):
+                    await _finish_thread(release, result)
             raise
         except Exception:
             return await JSONResponse({'error': {'message': '流量控制服务暂不可用', 'type': 'gateway_unavailable'}},

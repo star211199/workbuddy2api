@@ -15,9 +15,24 @@ import urllib.request
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import webbrowser
+
 from desktop.common import ROOT, VERSION, atomic_json, data_dir
 from desktop.runtime import configure_node, ensure_node, ensure_webview2
+from desktop.tray import TrayController, available as tray_available
 from desktop.updates import UpdateService
+
+
+class _NullTray:
+    """Stand-in used before the real tray exists and when tray mode is off."""
+
+    def set_state(self, state):
+        pass
+
+    def notify(self, message):
+        pass
+
+    state = "stopped"
 
 
 def select_port(preferred: int) -> int:
@@ -175,6 +190,9 @@ class DesktopAPI:
         self.start_lock = threading.Lock()
         self.runtime_lock = threading.Lock()
         self.update_lock = threading.Lock()
+        # Assigned immediately after construction; a no-op stub keeps every call
+        # site safe even if construction fails before the tray is attached.
+        self.tray = _NullTray()
 
     def startup_status(self):
         return {"message": self.message, "failed": self.failed}
@@ -289,6 +307,7 @@ class DesktopAPI:
                 return
             self.failed = False
             self.message = "正在启动本地服务…"
+            self.tray.set_state("starting")
             if self.process and self.process.poll() is None:
                 self.process.terminate()
                 self.process.wait(timeout=10)
@@ -320,6 +339,11 @@ class DesktopAPI:
                         if not json.load(response).get("ready"):
                             continue
                     save_port(self.base, self.config, self.port)
+                    self.tray.set_state("running")
+                    if not self.window:
+                        # Tray-only session: starting succeeded, so nothing else to show.
+                        self.tray.notify(f"服务已启动 · 控制台端口 {self.port}")
+                        return
                     self.window.load_url(f"http://127.0.0.1:{self.port}/admin?desktop=1")
                     if os.getenv("WB_DESKTOP_SMOKE"):
                         threading.Thread(target=self._smoke_test, daemon=True).start()
@@ -331,7 +355,11 @@ class DesktopAPI:
         except Exception as exc:
             self.message = str(exc)
             self.failed = True
+            self.tray.set_state("stopped")
+            self.tray.notify(f"启动失败：{exc}")
             logging.exception("Backend startup failed")
+            if not self.window:
+                return
             try:
                 self.window.evaluate_js("document.getElementById('status').textContent=" + json.dumps(self.message) +
                                         ";document.getElementById('bar').style.display='none'")
@@ -339,6 +367,119 @@ class DesktopAPI:
                 pass
         finally:
             self.start_lock.release()
+
+    # -- tray-driven actions --------------------------------------------
+
+    def _window_alive(self, window) -> bool:
+        """pywebview drops closed windows from its registry; that is the truth."""
+        import webview
+        return window is not None and window in webview.windows
+
+    def open_window(self):
+        """Show the embedded console window, creating it on demand.
+
+        Closing the window destroys it (pywebview has no reliable hide-on-close
+        hook), but the backend keeps running and the tray reopens a fresh one.
+        Window creation runs on the tray thread, so failures surface as a tray
+        notification instead of an unhandled traceback.
+        """
+        import webview
+        if self._window_alive(self.window):
+            try:
+                self.window.show()
+                self.window.restore()
+                return {"ok": True}
+            except Exception:
+                logging.exception("Failed to restore window")
+        try:
+            self.window = webview.create_window(
+                f"WorkBuddy2API · v{VERSION}", html=SPLASH, js_api=Bridge(self),
+                width=1280, height=860, min_size=(900, 600),
+                background_color="#f5f6f8", text_select=True)
+        except Exception as exc:
+            logging.exception("Window creation failed from tray")
+            self.window = None
+            self.tray.notify("窗口创建失败，请改用「在浏览器中打开」")
+            return {"error": str(exc)}
+        self.window.events.closed += self._on_window_closed
+        if self.running():
+            self.window.load_url(f"http://127.0.0.1:{self.port}/admin?desktop=1")
+        else:
+            self.start()
+        return {"ok": True}
+
+    def open_console(self):
+        """Open the admin console in the user's default browser.
+
+        Starting is asynchronous and the port can shift when the configured one
+        is taken by another deployment (a restart picks a new port), so resolve
+        *this instance's* actual port and only open once it accepts TCP. A
+        timeout notifies instead of handing the browser a dead URL.
+
+        The URL carries a short-lived JWT (?token=) because a plain browser has
+        no pywebview bridge to sign in with: ?desktop=1 hides the login form
+        behind an overlay that only clears once that bridge reports ready, so
+        without a token the browser would sit on a blank boot screen forever.
+        """
+        if not self.running():
+            self.start()
+            # Wait for _start_worker to commit a port before probing it.
+            deadline = time.monotonic() + 90
+            while not self.port and time.monotonic() < deadline and not self.closing.is_set():
+                time.sleep(.25)
+        port = self.port
+        if not port:
+            self.tray.notify("服务未能启动，无法打开控制台（见日志目录）")
+            return {"error": "服务未启动"}
+        deadline = time.monotonic() + 60
+        ready = False
+        while time.monotonic() < deadline and not self.closing.is_set():
+            with socket.socket() as probe:
+                probe.settimeout(.25)
+                if probe.connect_ex(("127.0.0.1", port)) == 0:
+                    ready = True
+                    break
+            if not self.running():
+                break  # backend died while we waited; don't spin for 60s
+            time.sleep(.5)
+        if not ready:
+            self.tray.notify(f"端口 {port} 未就绪，请稍后重试")
+            return {"error": "服务未就绪"}
+        from datetime import datetime, timedelta, timezone
+        import jwt
+        token = jwt.encode({"sub": self.config["username"],
+                            "exp": datetime.now(timezone.utc) + timedelta(hours=24)},
+                           self.config["jwt_secret"], algorithm="HS256")
+        url = f"http://127.0.0.1:{port}/admin?token={token}"
+        webbrowser.open(url)
+        # Restarts can move the port; make sure the user knows which one is live.
+        self.tray.notify(f"控制台已在浏览器打开（端口 {port}，免登录）")
+        return {"ok": True, "url": url}
+
+    def _on_window_closed(self):
+        """Close button must not stop services - the app lives in the tray."""
+        self.window = None
+
+    def _state_monitor(self):
+        """Reconcile the tray badge when the backend dies on its own."""
+        while not self.closing.wait(2):
+            if self.tray.state == "running" and not self.running():
+                self.tray.set_state("stopped")
+                self.tray.notify("本地服务已退出，可从托盘菜单重新启动")
+
+    def quit(self):
+        """Exit the application entirely (tray → 退出)."""
+        self.stop()
+        try:
+            import webview
+            for window in list(webview.windows):  # emptying the registry ends the loop
+                try:
+                    window.destroy()
+                except Exception:
+                    logging.exception("Failed to destroy window during quit")
+        except Exception:
+            logging.exception("Quit failed")
+        return {"ok": True}
 
     def _smoke_test(self):
         result = {"ok": False, "version": VERSION, "port": self.port}
@@ -359,21 +500,91 @@ class DesktopAPI:
             atomic_json(Path(os.environ["WB_DESKTOP_SMOKE"]), result)
             self.window.destroy()
 
-    def stop(self):
-        self.closing.set()
+    def running(self) -> bool:
+        """True only while the backend child process is alive."""
+        return bool(self.process and self.process.poll() is None)
+
+    def teardown_backend(self):
+        """Terminate the backend child, escalating to kill if it ignores us.
+
+        The venv interpreter is a shim that spawns the real runtime as a child,
+        so a bare terminate() can orphan the actual uvicorn process; kill the
+        whole tree instead. The port is dropped so the next start re-selects it.
+        """
         if self.process and self.process.poll() is None:
+            pid = self.process.pid
             self.process.terminate()
             try:
                 self.process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                               capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+        self.process = None
+        self.port = 0  # the next start re-selects; stale values would misdirect the console
+
+    def start(self):
+        """Start services and load the console. Used by both splash and tray."""
+        if self.closing.is_set():
+            return {"error": "客户端正在关闭"}
+        if self.start_lock.acquire(blocking=False):
+            threading.Thread(target=self._start_worker, daemon=True).start()
+            return {"ok": True}
+        # A start is already in flight; report where things stand without queueing another.
+        return {"ok": True, "busy": True}
+
+    def restart(self):
+        """Tear down the backend and bring it back on the same port."""
+        if self.closing.is_set():
+            return {"error": "客户端正在关闭"}
+        if self.start_lock.acquire(blocking=False):
+            threading.Thread(target=self._restart_worker, daemon=True).start()
+            return {"ok": True}
+        return {"ok": True, "busy": True}
+
+    def _restart_worker(self):
+        try:
+            self.tray.set_state("starting")
+            self.teardown_backend()
+            self.start_lock.release()
+            self.start()
+        except Exception as exc:
+            self.start_lock.release()
+            self.tray.set_state("stopped")
+            logging.exception("Restart failed")
+            self.tray.notify(f"重启失败：{exc}")
+
+    def stop_services(self):
+        """Stop the backend but keep the app resident so it can be restarted."""
+        self.teardown_backend()
+        self.tray.set_state("stopped")
+        self.tray.notify("服务已停止")
+        if self._window_alive(self.window):
+            # Back to the splash page; its 重试启动 button is still wired to us.
+            try:
+                self.window.load_html(SPLASH)
+            except Exception:
+                logging.getLogger("desktop.tray").debug("无法刷新停止界面", exc_info=True)
+        return {"ok": True}
+
+    def stop(self):
+        self.closing.set()
+        self.teardown_backend()
 
 
-def run():
+def run(tray_mode: bool = False):
+    """桌面向前端入口。
+
+    tray_mode: 双击 EXE 或开机自启时的默认路径 —— 只放托盘图标，不起服务、不开窗口，
+    由用户在右键菜单里决定何时启动。窗口模式（不开托盘）保持旧行为以兼容 --smoke-test。
+    """
     if os.name != "nt":
         raise RuntimeError("桌面 EXE 支持 Windows 10/11 x64")
     import msvcrt
+    import webview
     base = data_dir()
     # Use a per-user lock rather than a PID file (stale PID files cannot block startup).
     lock = (base / "desktop.lock").open("a+b")
@@ -381,23 +592,46 @@ def run():
     try:
         msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError:
-        ctypes.windll.user32.MessageBoxW(None, "WorkBuddy2API 已在运行，请查看已打开的窗口。", "WorkBuddy2API", 64)
+        ctypes.windll.user32.MessageBoxW(None, "WorkBuddy2API 已在运行，请查看系统托盘图标。", "WorkBuddy2API", 64)
         lock.close()
         return
-    api = None
+    api = tray = None
     try:
         config = configure_environment(base)
         setup_logging(base)
         ensure_webview2(base)
-        import webview
         api = DesktopAPI(base, config)
-        window = webview.create_window(f"WorkBuddy2API · v{VERSION}", html=SPLASH, js_api=Bridge(api),
-                                      width=1280, height=860, min_size=(900, 600),
-                                      background_color="#f5f6f8", text_select=True)
-        api.window = window
-        window.events.closed += api.stop
         webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
-        webview.start(lambda: (api.retry_runtime(), api.retry_start()), gui="edgechromium",
+
+        if tray_mode:
+            tray = TrayController(api, ROOT, VERSION)
+            api.tray = tray
+            if not tray.start():
+                ctypes.windll.user32.MessageBoxW(
+                    None, "托盘组件不可用，将以窗口模式启动。\n\n数据和日志：" + str(base),
+                    "WorkBuddy2API", 48)
+                tray_mode = False
+
+        if not tray_mode:
+            # Original path: window owns everything, closing it exits the app.
+            window = webview.create_window(f"WorkBuddy2API · v{VERSION}", html=SPLASH, js_api=Bridge(api),
+                                          width=1280, height=860, min_size=(900, 600),
+                                          background_color="#f5f6f8", text_select=True)
+            api.window = window
+            window.events.closed += api.stop
+            webview.start(lambda: (api.retry_runtime(), api.retry_start()), gui="edgechromium",
+                          private_mode=False, storage_path=str(base / "webview"),
+                          icon=str(ROOT / "desktop/assets/app.ico"))
+            return
+
+        # Tray mode: no window, no services - both start from the tray menu.
+        # pywebview's GUI loop exits once every window is gone, so an invisible
+        # 1x1 host window keeps the process resident between console sessions.
+        threading.Thread(target=api._state_monitor, name="tray-state", daemon=True).start()
+        webview.create_window("__tray_host__", html="<!doctype html><title></title>",
+                              width=1, height=1, frameless=True, hidden=True)
+        tray.notify("WorkBuddy2API 已在托盘运行，右键图标启动服务。")
+        webview.start(api.retry_runtime, gui="edgechromium",
                       private_mode=False, storage_path=str(base / "webview"),
                       icon=str(ROOT / "desktop/assets/app.ico"))
     except Exception as exc:
@@ -406,4 +640,6 @@ def run():
     finally:
         if api:
             api.stop()
+        if tray:
+            tray.stop()
         lock.close()

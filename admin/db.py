@@ -131,6 +131,7 @@ def init_db() -> bool:
         _ensure_column("usage_logs", "cached_tokens", "INT", "NULL")
         _ensure_column("usage_logs", "client_ip", "VARCHAR(64)", "DEFAULT ''")
         _ensure_column("usage_logs", "use_case", "VARCHAR(64)", "DEFAULT ''")
+        _ensure_column("usage_logs", "reasoning_effort", "VARCHAR(32)", "DEFAULT ''")
         # 迁移：给 usage_logs 表加请求级表格日志字段
         _ensure_column("usage_logs", "seq", "INT", "DEFAULT 0")
         _ensure_column("usage_logs", "ttfb_ms", "INT", "NULL")
@@ -167,6 +168,12 @@ def init_db() -> bool:
 
         # 迁移：api_keys 加 group_id 列（绑定模型分组；0=不限制）
         _ensure_column("api_keys", "group_id", "INT", "DEFAULT 0")
+        _ensure_column("api_keys", "account_id", "INT", "NULL")
+        # 迁移：api_keys 加 max_concurrent（NULL=全局；0=不限；N=N 路并发）
+        _ensure_column("api_keys", "max_concurrent", "INT", "NULL")
+        # Ownership must have a database constraint, including concurrent creates.
+        next(i for i in models.ApiKey.__table__.indexes
+             if i.name == "ux_api_keys_account").create(bind=engine, checkfirst=True)
 
         # 迁移：使用记录/日志的查询索引。
         #

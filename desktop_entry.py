@@ -13,9 +13,14 @@ if __name__ == "__main__":
         if sys.stderr is None:
             sys.stderr = open(os.devnull, "w", encoding="utf-8")
     from desktop.app import backend, run
-    if len(sys.argv) == 3 and sys.argv[1] == "--smoke-test":
-        os.environ["WB_DESKTOP_SMOKE"] = sys.argv[2]
     if len(sys.argv) == 3 and sys.argv[1] == "--backend":
         backend(int(sys.argv[2]))
-    else:
+    elif len(sys.argv) == 3 and sys.argv[1] == "--smoke-test":
+        # Packaging verification needs the legacy windowed flow, never the tray.
+        os.environ["WB_DESKTOP_SMOKE"] = sys.argv[2]
         run()
+    else:
+        # Double-clicking the EXE (or the autostart Run entry) should only drop a
+        # tray icon in place; services start from its menu. Pass --no-tray for the
+        # original single-window behaviour.
+        run(tray_mode="--no-tray" not in sys.argv)

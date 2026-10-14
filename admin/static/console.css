@@ -59,7 +59,8 @@ button:focus-visible, summary:focus-visible { outline:2px solid var(--brand-ink)
 .acc-table thead th:last-child { text-align:right; }
 .acc-table tbody td.c-ops { white-space:nowrap; }
 .limit-chip { display:inline-flex; align-items:center; gap:4px; margin-left:6px; padding:2px 6px; border-radius:5px; font-size:10px; color:var(--warn); background:var(--warn-soft); white-space:nowrap; cursor:pointer; }
-.gateway-chip { font-size:10px; color:var(--fg-muted); margin-left:6px; }
+.gateway-chip { display:inline-flex; align-items:center; gap:4px; margin-left:6px; padding:2px 6px; border-radius:5px; font-size:10px; color:var(--fg-muted); background:transparent; border:1px solid var(--border); white-space:nowrap; cursor:pointer; }
+.gateway-chip:hover { color:var(--warn); border-color:var(--warn); background:var(--warn-soft); }
 #actionTooltip { position:fixed; z-index:100; max-width:260px; padding:9px 12px; border-radius:8px; background:#252b35; color:#f7f8fa; box-shadow:0 5px 20px rgba(0,0,0,.12); pointer-events:none; font-size:12px; line-height:1.5; }
 #actionTooltip strong { display:block; font-weight:500; }
 #actionTooltip span { display:block; color:#c1c8d2; font-size:11px; margin-top:3px; white-space:pre-line; overflow-wrap:anywhere; }

@@ -152,6 +152,7 @@ def _serialize(rows, key_names: dict, acc_names: dict) -> list[dict]:
             "cached_tokens": r.cached_tokens,
             "client_ip": r.client_ip or "",
             "use_case": r.use_case or "",
+            "reasoning_effort": r.reasoning_effort or "",
             "seq": r.seq,
             "ttfb_ms": r.ttfb_ms,
             "latency_ms": r.latency_ms,
@@ -301,7 +302,7 @@ def export_logs(
     buf.write("\ufeff")  # UTF-8 BOM，保证 Excel 正确识别中文
     w = csv.writer(buf)
     w.writerow(["ID", "Key", "账号", "模型", "积分", "提示tokens", "补全tokens", "缓存tokens", "总tokens",
-                "TTFB(ms)", "总耗时(ms)", "结果", "客户端IP", "用途", "时间(北京)"])
+                "TTFB(ms)", "总耗时(ms)", "结果", "客户端IP", "用途", "思考强度(请求)", "时间(北京)"])
 
     if not short:
         rows = q.order_by(UsageLog.id.desc()).limit(limit).all()
@@ -331,6 +332,7 @@ def export_logs(
                 _csv_safe(r.error_kind or ""),
                 _csv_safe(r.client_ip or ""),
                 _csv_safe(r.use_case or ""),
+                r.reasoning_effort or "",
                 t_str,
             ])
     return Response(

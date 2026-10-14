@@ -24,6 +24,48 @@ from desktop.updates import UpdateService, newer, release_url
 
 
 class UpdateTests(unittest.TestCase):
+    def test_source_backend_survives_missing_update_dependency(self):
+        # A source installation predating packaging must still serve the gateway.
+        # Use a fresh process so an already-imported dependency cannot hide this.
+        script = r'''
+import importlib.abc
+import sys
+class MissingPackaging(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'packaging' or fullname.startswith('packaging.'):
+            raise ModuleNotFoundError("No module named 'packaging'", name='packaging')
+sys.meta_path.insert(0, MissingPackaging())
+from admin.server import app
+from admin.security import require_admin
+import asyncio
+import httpx
+app.dependency_overrides[require_admin] = lambda: True
+async def check():
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+        assert (await client.get('/admin')).status_code == 200
+        assert (await client.get('/api/app/version')).status_code == 200
+        assert (await client.get('/v1/models')).status_code == 401
+        response = await client.get('/api/app/releases')
+        assert response.status_code == 503, response.text
+        assert 'packaging' in response.json()['detail']
+        assert (await client.get('/api/app/version')).status_code == 200
+asyncio.run(check())
+print('source backend survives missing packaging; update endpoint returns 503')
+'''
+        with tempfile.TemporaryDirectory() as work:
+            env = dict(os.environ)
+            for key in list(env):
+                if key.startswith(('ADMIN_', 'CONVERTER_', 'WORKBUDDY_')):
+                    env.pop(key)
+            env.update(ADMIN_DATABASE_URL='sqlite:///' + (Path(work) / 'test.db').as_posix(),
+                       ADMIN_REDIS_URL='', ADMIN_GATEWAY_LIMIT_BACKEND='memory',
+                       ADMIN_JWT_SECRET='offline-test-secret-with-at-least-32-bytes',
+                       PYTHONUTF8='1')
+            result = subprocess.run([sys.executable, '-c', script], cwd=ROOT,
+                                    env=env, capture_output=True, text=True,
+                                    encoding='utf-8', timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_stable_versions(self):
         self.assertTrue(newer("v1.10.0", "1.9.0"))
         for tag in ("v1.9.0", "v1.8.0", "v2.0.0rc1", "nightly"):
@@ -137,7 +179,8 @@ class FreshBackendTests(unittest.TestCase):
                     env.pop(key)
             output = (base / "test.log").open("wb")
             process = subprocess.Popen([sys.executable, str(ROOT / "desktop_entry.py"), "--backend", str(port)],
-                                       env=env, stdout=output, stderr=output)
+                                       env=env, stdout=output, stderr=output,
+                                       creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
             try:
                 url = f"http://127.0.0.1:{port}"
                 for _ in range(100):

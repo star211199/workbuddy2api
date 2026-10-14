@@ -12,9 +12,12 @@ Anthropic Messages API 参考：https://docs.anthropic.com/en/docs/messages
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from typing import Any
+
+_logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # ID 生成
@@ -164,8 +167,12 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
     blocks = content
 
     # 检查是否包含 tool_result（role=user 时）
+    #
+    # OpenAI/上游要求：assistant.tool_calls 之后必须**紧接**对应的 role:tool。
+    # 因此 tool_result 必须先输出；user 文本/图片只能排在 tool 结果之后，
+    # 绝不能 insert 到最前——否则会切断配对，上游报 11148。
     if role == "user":
-        result: list[dict] = []
+        tool_msgs: list[dict] = []
         content_parts: list[dict] = []
         has_images = False
         for block in blocks:
@@ -178,17 +185,20 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
                 content_parts.append(_image_block_to_chat_part(block))
                 has_images = True
             elif bt == "tool_result":
-                # tool_result → 独立的 tool 消息
-                tc_id = block.get("tool_use_id", "")
-                output = block.get("content", "")
-                if isinstance(output, list):
-                    output = "".join(
-                        b.get("text", "") for b in output if isinstance(b, dict) and b.get("type") == "text"
-                    )
-                result.append({"role": "tool", "tool_call_id": tc_id, "content": output})
+                # tool_result → 独立的 tool 消息（必须紧随 assistant.tool_calls）
+                tc_id = block.get("tool_use_id") or ""
+                if not tc_id:
+                    # 空 id 无法与 tool_use 配对，上送必触发 11148；直接丢弃
+                    _logger.debug("drop tool_result with empty tool_use_id")
+                    continue
+                output = _tool_result_to_text(block.get("content", ""))
+                if block.get("is_error"):
+                    output = f"Error: {output}" if output else "Error: tool execution failed"
+                tool_msgs.append({"role": "tool", "tool_call_id": tc_id, "content": output})
+        result = list(tool_msgs)
         if content_parts:
             content = content_parts if has_images else "".join(part["text"] for part in content_parts)
-            result.insert(0, {"role": "user", "content": content})
+            result.append({"role": "user", "content": content})
         return result
 
     # assistant 角色
@@ -202,8 +212,9 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
             if bt == "text":
                 text_parts.append(block.get("text", ""))
             elif bt == "tool_use":
+                # 键缺失或值为 null/"" 都要生成新 id，保证与 tool_result 可配对
                 tc = {
-                    "id": block.get("id", _rand_id("call_")),
+                    "id": block.get("id") or _rand_id("call_"),
                     "type": "function",
                     "function": {
                         "name": block.get("name", ""),
@@ -223,6 +234,34 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
     # 其他角色：尝试提取文本
     text = _extract_blocks_text(blocks)
     return [{"role": role, "content": text}] if text else []
+
+
+def _tool_result_to_text(output) -> str:
+    """把 Anthropic tool_result.content 转成纯文本。
+
+    - str → 原样
+    - list → 拼接 text 块；非 text 块序列化为短 JSON，避免静默丢成空串
+    - 其它/None → 空串
+    """
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if not isinstance(output, list):
+        return str(output)
+    parts: list[str] = []
+    for b in output:
+        if not isinstance(b, dict):
+            parts.append(str(b))
+            continue
+        if b.get("type") == "text":
+            parts.append(b.get("text", "") or "")
+        else:
+            try:
+                parts.append(json.dumps(b, ensure_ascii=False)[:500])
+            except Exception:
+                parts.append(f"<{b.get('type') or 'block'}>")
+    return "".join(parts)
 
 
 def _extract_blocks_text(blocks: list) -> str:

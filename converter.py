@@ -189,6 +189,8 @@ def auth_dirs() -> list[Path]:
     也忘了配 CODEBUDDY_AUTH_DIR，结果 /gw 下所有端点 503。多列几个候选能让
     「凭据放对地方」就自动生效，而不是必须记得配环境变量。
     """
+    if os.getenv("WORKBUDDY_ANDROID") == "1":
+        return []
     env_dir = os.environ.get("CODEBUDDY_AUTH_DIR")
     if env_dir:
         return [Path(env_dir)]
@@ -269,7 +271,24 @@ class CredentialManager:
 
     def _is_expired(self) -> bool:
         s = self._session()
-        expires_at = (s.get("auth") or {}).get("expiresAt") or 0
+        auth = s.get("auth") or {}
+        try:
+            expires_at = float(auth.get("expiresAt") or 0)
+        except (TypeError, ValueError):
+            expires_at = 0
+        if 0 < expires_at < 100_000_000_000:
+            expires_at *= 1000
+        if not expires_at:
+            # The login validator accepts a JWT expiry without expiresAt. Use
+            # the same scheduling hint here instead of refreshing every call.
+            # This does not authenticate the JWT; the upstream still verifies it.
+            try:
+                import jwt
+                claims = jwt.decode(auth.get('accessToken') or '',
+                                    options={'verify_signature': False})
+                expires_at = float(claims.get('exp') or 0) * 1000
+            except Exception:
+                expires_at = 0
         # 提前 60s 判定过期
         return time.time() * 1000 >= (expires_at - 60_000)
 
@@ -361,14 +380,26 @@ class CredentialManager:
 
     def _request_backend(self, method: str, path: str, json_body: dict | None = None) -> dict:
         """向后端发一个同步请求，返回 {code, msg, requestId, data} 或抛异常。"""
-        headers = self.get_headers()
         url = f"{BACKEND}{path}"
+        client_options = {}
+        request_options = {}
+        timeout = 15
+        if os.getenv("WORKBUDDY_ANDROID") == "1":
+            from admin import upstream_http, request_metrics
+            client_options['verify'] = upstream_http.ssl_context()
+            request_options['extensions'] = {'trace': request_metrics.network_trace()}
+            if path.endswith('/models'):
+                timeout = httpx.Timeout(connect=3, read=4, write=4, pool=2)
+            with request_metrics.measure('metadata_credentials'):
+                headers = self.get_headers()
+        else:
+            headers = self.get_headers()
         try:
-            with httpx.Client(timeout=15, limits=_HTTP_LIMITS) as c:
+            with httpx.Client(timeout=timeout, limits=_HTTP_LIMITS, **client_options) as c:
                 if method.upper() == "GET":
-                    r = c.get(url, headers=headers)
+                    r = c.get(url, headers=headers, **request_options)
                 else:
-                    r = c.post(url, headers=headers, json=json_body or {})
+                    r = c.post(url, headers=headers, json=json_body or {}, **request_options)
         except Exception as e:
             raise RuntimeError(f"后端请求网络失败 {method} {path}: {e}")
         try:
